@@ -3,6 +3,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
+from spotipy.exceptions import SpotifyException
 
 from .auth import make_auth, make_client
 from .config import DATA_CACHE_DIR
@@ -121,10 +122,20 @@ class Backend(QObject):
         if cached:
             self.tracksLoaded.emit(cached, name)
         raw = []
-        res = self._sp.playlist_items(playlist_id, limit=100, additional_types=["track"])
-        while res:
-            raw += res["items"]
-            res = self._sp.next(res) if res.get("next") else None
+        try:
+            res = self._sp.playlist_items(playlist_id, limit=100, additional_types=["track"])
+            while res:
+                raw += res["items"]
+                res = self._sp.next(res) if res.get("next") else None
+        except SpotifyException as e:
+            # Spotify blocks Web API access to its own algorithmic/editorial
+            # playlists (Discover Weekly, Daily Mix, Release Radar, …)
+            if e.http_status in (403, 404):
+                self.tracksLoaded.emit([], name)
+                self.toast.emit("Spotify won't share this playlist's tracks — "
+                                "it's one of their editorial/algorithmic playlists.")
+                return
+            raise
         # some API/spotipy versions return the track under "item" instead of "track"
         tracks = [(r.get("track") or r.get("item")) for r in raw]
         tracks = [t for t in tracks if t and t.get("id")]
