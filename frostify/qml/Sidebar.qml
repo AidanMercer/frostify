@@ -63,7 +63,8 @@ Item {
                         width: parent.width
                     }
                     Text {
-                        text: modelData.count + " tracks"
+                        text: modelData.count > 0 ? (modelData.count + " tracks")
+                            : (modelData.owner !== "" ? modelData.owner : "playlist")
                         color: Theme.subtext
                         font.pixelSize: 11
                         elide: Text.ElideRight
