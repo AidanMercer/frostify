@@ -1,0 +1,5 @@
+# on Arch these come from system packages (see README), pip not required:
+#   sudo pacman -S pyside6
+#   paru -S python-spotipy
+PySide6>=6.7
+spotipy>=2.24

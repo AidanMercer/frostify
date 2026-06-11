@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+
+# never commit secrets / tokens
+config.toml
+.cache

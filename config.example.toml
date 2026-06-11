@@ -1,0 +1,4 @@
+# copy this to ~/.config/frostify/config.toml and fill in your Client ID
+[spotify]
+client_id = "your-client-id-here"
+redirect_uri = "http://127.0.0.1:8888/callback"
