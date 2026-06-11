@@ -66,6 +66,7 @@ class Backend(QObject):
         self._np_playing_since = 0.0   # monotonic: (now - since)*1000 = progressMs
         self._np_duration_ms = 0
         self._spotifyd_device_id = None  # cached Spotify Connect device ID
+        self._user_id = None             # cached Spotify user id (for creating playlists)
         self._tick = 0
 
         # 1s timer — drives both local interpolation and the periodic D-Bus re-read
@@ -315,7 +316,7 @@ class Backend(QObject):
     def _playlists_task(self, force=False):
         cached, fresh = self._cache_get("playlists.json", TTL_PLAYLISTS)
         if cached is not None:
-            self.playlistsLoaded.emit(cached)
+            self.playlistsLoaded.emit(self._apply_pins(cached))
             if fresh and not force:
                 return
         out = []
@@ -334,8 +335,61 @@ class Backend(QObject):
                 })
             res = self._sp.next(res) if res.get("next") else None
         if out != cached:
-            self.playlistsLoaded.emit(out)
-        self._cache_write("playlists.json", out)
+            self.playlistsLoaded.emit(self._apply_pins(out))
+        self._cache_write("playlists.json", out)  # cache the raw (unpinned) order
+
+    # ---- pinning (local only — Spotify's API doesn't expose its pin feature) ----
+
+    def _load_pinned(self):
+        try:
+            p = DATA_CACHE_DIR / "pinned.json"
+            if p.exists():
+                v = json.loads(p.read_text())
+                if isinstance(v, list):
+                    return v
+        except Exception:
+            pass
+        return []
+
+    def _apply_pins(self, playlists):
+        """Tag each playlist with `pinned` and float pinned ones to the top,
+        in pin order; everything else keeps its original order (stable sort)."""
+        pinned = self._load_pinned()
+        rank = {pid: i for i, pid in enumerate(pinned)}
+        decorated = [{**p, "pinned": p["id"] in rank} for p in playlists]
+        decorated.sort(key=lambda p: rank.get(p["id"], len(pinned)))
+        return decorated
+
+    @Slot(str)
+    def togglePin(self, playlist_id):
+        pinned = self._load_pinned()
+        if playlist_id in pinned:
+            pinned.remove(playlist_id)
+            msg = "Unpinned"
+        else:
+            pinned.insert(0, playlist_id)
+            msg = "Pinned"
+        try:
+            (DATA_CACHE_DIR / "pinned.json").write_text(json.dumps(pinned))
+        except Exception:
+            pass
+        self.toast.emit(msg)
+        self._submit(self._playlists_task)  # re-emit from cache with new order
+
+    @Slot(str)
+    def createPlaylist(self, name):
+        self._submit(self._create_playlist_task, name)
+
+    def _create_playlist_task(self, name):
+        name = name.strip()
+        if not name:
+            return
+        if not self._user_id:
+            self._user_id = self._sp.current_user()["id"]
+        self._sp.user_playlist_create(self._user_id, name, public=False)
+        self._cache_delete("playlists.json")
+        self.toast.emit(f"Created “{name}”")
+        self._playlists_task(force=True)  # already on the worker thread
 
     @Slot(str, str, str)
     def openPlaylist(self, playlist_id, name, context_uri):

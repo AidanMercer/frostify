@@ -42,7 +42,7 @@ Item {
                 spacing: 8
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: "♫"
+                    text: modelData.pinned ? "📌" : "♫"
                     color: index === root.cursor && root.active ? Theme.selText : Theme.teal
                     font.pixelSize: 13
                 }

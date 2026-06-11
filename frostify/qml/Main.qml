@@ -128,6 +128,10 @@ ApplicationWindow {
                     backend.toggleLike(t.id, !t.liked); e.accepted = true
                 }
                 else if (e.text === "r") { win.refreshCurrent(); e.accepted = true }
+                else if (e.text === "p" && win.activePane === "playlists" && win.playlists[win.plCursor]) {
+                    backend.togglePin(win.playlists[win.plCursor].id); e.accepted = true
+                }
+                else if (e.text === "n") { newPlaylistPrompt.open(); e.accepted = true }
             }
         }
 
@@ -283,6 +287,58 @@ ApplicationWindow {
                     font.pixelSize: 13; font.bold: true
                 }
                 MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: backend.login() }
+            }
+        }
+    }
+
+    // ---- new-playlist prompt (press 'n' in the playlists pane) ----
+    Rectangle {
+        id: newPlaylistPrompt
+        anchors.fill: parent
+        radius: Theme.radius
+        color: "#cc000000"
+        visible: false
+        z: 100
+        function open() { visible = true; nameInput.text = ""; nameInput.forceActiveFocus() }
+        function close() { visible = false; keys.forceActiveFocus() }
+
+        // click outside the card to dismiss
+        MouseArea { anchors.fill: parent; onClicked: newPlaylistPrompt.close() }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: 380; height: 140
+            radius: Theme.radius
+            color: Theme.bg
+            border.color: Theme.border; border.width: 1
+            MouseArea { anchors.fill: parent }  // swallow clicks so the card doesn't dismiss
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 18
+                spacing: 12
+                Text { text: "New playlist"; color: Theme.text; font.pixelSize: 15; font.bold: true }
+                Rectangle {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 34
+                    radius: Theme.radiusSm
+                    color: Theme.glassSoft
+                    border.color: Theme.accent; border.width: 1
+                    TextField {
+                        id: nameInput
+                        anchors.fill: parent
+                        anchors.leftMargin: 10; anchors.rightMargin: 10
+                        verticalAlignment: TextInput.AlignVCenter
+                        color: Theme.text; font.pixelSize: 13
+                        background: Item {}
+                        onAccepted: {
+                            if (text.trim().length) backend.createPlaylist(text.trim())
+                            newPlaylistPrompt.close()
+                        }
+                        Keys.onEscapePressed: newPlaylistPrompt.close()
+                    }
+                }
+                Text { text: "Enter to create  ·  Esc to cancel"; color: Theme.subtext; font.pixelSize: 11 }
             }
         }
     }
