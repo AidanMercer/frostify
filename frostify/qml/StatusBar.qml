@@ -43,7 +43,9 @@ Item {
             Text {
                 id: stateTxt
                 anchors.centerIn: parent
-                text: !root.np.active ? "■ STOPPED" : (root.np.isPlaying ? "▶ PLAYING" : "⏸ PAUSED")
+                text: root.np.rateLimited ? "⚠ LIMITED"
+                      : !root.np.active ? "■ STOPPED"
+                      : (root.np.isPlaying ? "▶ PLAYING" : "⏸ PAUSED")
                 color: Theme.selText
                 font.pixelSize: 11
                 font.bold: true
@@ -56,7 +58,8 @@ Item {
 
         Text {
             anchors.verticalCenter: parent.verticalCenter
-            text: root.np.active ? (root.np.name + "  ·  " + root.np.artist)
+            text: root.np.rateLimited ? "Spotify rate-limited this app — pausing calls (clears on its own)"
+                  : root.np.active ? (root.np.name + "  ·  " + root.np.artist)
                   : (root.np.private ? "private session — turn it off in Spotify to see the track"
                      : "nothing playing")
             color: root.np.active ? Theme.text : Theme.subtext

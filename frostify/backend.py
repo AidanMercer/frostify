@@ -39,9 +39,11 @@ class Backend(QObject):
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._auth = make_auth()
         self._sp = make_client(self._auth)
-        # when Spotify rate-limits us (429), back off until this monotonic time
+        # when Spotify rate-limits us (429), back off until this monotonic time;
+        # escalate the wait on repeated hits and only nag the user once per episode
         self._backoff_until = 0.0
-        self._last_rl_toast = 0.0
+        self._rl_strikes = 0
+        self._rl_notified = False
         # remember the now-playing track's liked state so we only hit the
         # "is it saved?" endpoint when the track actually changes, not every poll
         self._np_id = None
@@ -99,19 +101,26 @@ class Backend(QObject):
             self.error.emit(str(e))
 
     def _on_rate_limited(self, e):
-        # Spotify hands back a Retry-After (seconds) — stop hitting the API until
-        # then so we don't dig the hole deeper, and tell the user once.
         try:
-            retry = int(e.headers.get("Retry-After", "5")) if e.headers else 5
+            header_retry = int(e.headers.get("Retry-After", "0")) if e.headers else 0
         except (ValueError, TypeError):
-            retry = 5
-        self._backoff_until = time.monotonic() + retry
-        now = time.monotonic()
-        if now - self._last_rl_toast > 10:
-            self._last_rl_toast = now
-            mins = max(1, round(retry / 60))
-            when = f"~{mins} min" if retry < 5400 else f"~{round(retry / 3600, 1)} h"
-            self.toast.emit(f"Spotify rate-limited this app — backing off for {when}.")
+            header_retry = 0
+        self._rl_strikes += 1
+        # escalate so we stop poking a banned API every few seconds, but CAP the
+        # wait: a Retry-After can be hours, and honouring it literally would lock
+        # us out long after the ban actually lifts. Better to re-probe every few
+        # minutes — if still banned we just back off again.
+        backoff = max(header_retry, 15 * (2 ** min(self._rl_strikes, 6)))
+        backoff = min(backoff, 300)
+        self._backoff_until = time.monotonic() + backoff
+        # surface it in the status bar instead of repeated toasts
+        self.nowPlaying.emit({"active": False, "rateLimited": True})
+        if not self._rl_notified:   # one toast per ban episode
+            self._rl_notified = True
+            mins = max(1, round(backoff / 60))
+            when = f"~{mins} min" if backoff < 5400 else f"~{round(backoff / 3600, 1)} h"
+            self.toast.emit(f"Spotify rate-limited this app — pausing API calls for {when}. "
+                            "Usually clears on its own; just leave it open.")
 
     # ---- auth ----
     @Slot()
@@ -150,11 +159,15 @@ class Backend(QObject):
     def loadPlaylists(self):
         self._submit(self._playlists_task)
 
-    def _playlists_task(self):
+    @Slot()
+    def refreshPlaylists(self):
+        self._submit(self._playlists_task, True)
+
+    def _playlists_task(self, force=False):
         cached, fresh = self._cache_get("playlists.json", TTL_PLAYLISTS)
         if cached is not None:
             self.playlistsLoaded.emit(cached)
-            if fresh:
+            if fresh and not force:
                 return  # cache still good — don't touch the API
         out = []
         res = self._sp.current_user_playlists(limit=50)
@@ -179,12 +192,16 @@ class Backend(QObject):
     def openPlaylist(self, playlist_id, name, context_uri):
         self._submit(self._tracks_task, playlist_id, name, context_uri)
 
-    def _tracks_task(self, playlist_id, name, context_uri):
+    @Slot(str, str, str)
+    def refreshPlaylist(self, playlist_id, name, context_uri):
+        self._submit(self._tracks_task, playlist_id, name, context_uri, True)
+
+    def _tracks_task(self, playlist_id, name, context_uri, force=False):
         key = f"tracks/{playlist_id}.json"
         cached, fresh = self._cache_get(key, TTL_TRACKS)
         if cached is not None:
             self.tracksLoaded.emit(cached, name)
-            if fresh:
+            if fresh and not force:
                 return  # cache still good — don't touch the API
         raw = []
         try:
@@ -215,14 +232,18 @@ class Backend(QObject):
     def search(self, query):
         self._submit(self._search_task, query)
 
-    def _search_task(self, query):
+    @Slot(str)
+    def refreshSearch(self, query):
+        self._submit(self._search_task, query, True)
+
+    def _search_task(self, query, force=False):
         q = query.strip()
         if not q:
             self.searchLoaded.emit([])
             return
         key = "search/" + hashlib.md5(q.lower().encode()).hexdigest() + ".json"
         cached, fresh = self._cache_get(key, TTL_SEARCH)
-        if cached is not None and fresh:
+        if cached is not None and fresh and not force:
             self.searchLoaded.emit(cached)  # identical query seen recently — reuse
             return
         # Spotify now caps search limit at 10, so page through it for more results
@@ -352,6 +373,8 @@ class Backend(QObject):
         if time.monotonic() < self._backoff_until:
             return  # rate-limited — skip the poll rather than pile on more 429s
         pb = self._sp.current_playback()
+        self._rl_strikes = 0          # a real call got through — ban has lifted
+        self._rl_notified = False
         dev = (pb or {}).get("device") or {}
         # device info travels with every update so the UI can show where audio
         # is routed even when no track is visible (idle, or a private session)

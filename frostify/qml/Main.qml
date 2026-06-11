@@ -19,6 +19,7 @@ ApplicationWindow {
     property string openedName: ""
     property var np: ({ "active": false })
     property var devices: []
+    property var openedPlaylist: null
     property bool loggedIn: false
 
     // yazi-style cursor state
@@ -50,9 +51,22 @@ ApplicationWindow {
     function openPlaylist(p) {
         if (!p) return
         win.openedName = p.name
+        win.openedPlaylist = p
         backend.openPlaylist(p.id, p.name, p.uri)
         win.activePane = "tracks"
         win.trCursor = 0
+    }
+    // force-refetch whatever's on screen, bypassing the cache TTL
+    function refreshCurrent() {
+        if (win.activePane === "playlists") {
+            backend.refreshPlaylists()
+        } else if (win.mode === "search" && searchField.text.length) {
+            backend.refreshSearch(searchField.text)
+        } else if (win.openedPlaylist) {
+            var p = win.openedPlaylist
+            backend.refreshPlaylist(p.id, p.name, p.uri)
+        } else { return }
+        toast.show("Refreshing…", false)
     }
     function enterOrPlay() {
         if (activePane === "playlists") openPlaylist(playlists[plCursor])
@@ -113,6 +127,7 @@ ApplicationWindow {
                     var t = win.previewItem()
                     backend.toggleLike(t.id, !t.liked); e.accepted = true
                 }
+                else if (e.text === "r") { win.refreshCurrent(); e.accepted = true }
             }
         }
 
