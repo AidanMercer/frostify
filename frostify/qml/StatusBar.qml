@@ -4,10 +4,27 @@ Item {
     id: root
     property var np: ({ "active": false })
     property string position: "0/0"
+    signal pickDevice()
 
     function pct() {
         if (!np.active || !np.durationMs) return 0
         return Math.round(np.progressMs / np.durationMs * 100)
+    }
+
+    function deviceGlyph(type) {
+        switch (("" + type).toLowerCase()) {
+            case "computer":   return "💻"
+            case "smartphone": return "📱"
+            case "tablet":     return "📱"
+            case "speaker":    return "🔊"
+            case "tv":         return "📺"
+            case "castvideo":  return "📺"
+            case "avr":
+            case "stb":
+            case "gameconsole": return "🎮"
+            case "automobile": return "🚗"
+            default:           return "🔈"
+        }
     }
 
     // left: mode badge + transport
@@ -39,7 +56,9 @@ Item {
 
         Text {
             anchors.verticalCenter: parent.verticalCenter
-            text: root.np.active ? (root.np.name + "  ·  " + root.np.artist) : "nothing playing"
+            text: root.np.active ? (root.np.name + "  ·  " + root.np.artist)
+                  : (root.np.private ? "private session — turn it off in Spotify to see the track"
+                     : "nothing playing")
             color: root.np.active ? Theme.text : Theme.subtext
             font.pixelSize: 12
             elide: Text.ElideRight
@@ -53,6 +72,37 @@ Item {
         anchors.rightMargin: 12
         anchors.verticalCenter: parent.verticalCenter
         spacing: 8
+
+        // device badge — shows where audio is playing; click to switch
+        Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            height: 22; width: devRow.implicitWidth + 16; radius: Theme.radiusXs
+            color: devHover.hovered ? Theme.accentSoft : Theme.badge
+            border.color: devHover.hovered ? Theme.accent : "transparent"
+            border.width: 1
+            Behavior on color { ColorAnimation { duration: 120 } }
+            Row {
+                id: devRow
+                anchors.centerIn: parent
+                spacing: 5
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.deviceGlyph(root.np.deviceType); font.pixelSize: 11
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: root.np.deviceName ? root.np.deviceName : "no device"
+                    color: root.np.deviceName ? Theme.text : Theme.subtext
+                    font.pixelSize: 11; font.bold: true
+                }
+            }
+            HoverHandler { id: devHover }
+            MouseArea {
+                anchors.fill: parent
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.pickDevice()
+            }
+        }
 
         Rectangle {
             anchors.verticalCenter: parent.verticalCenter

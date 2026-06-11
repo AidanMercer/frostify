@@ -20,6 +20,7 @@ class Backend(QObject):
     tracksLoaded = Signal(list, str)
     searchLoaded = Signal(list)
     nowPlaying = Signal("QVariant")
+    devicesLoaded = Signal(list)
     error = Signal(str)
     toast = Signal(str)
 
@@ -181,6 +182,30 @@ class Backend(QObject):
         devs = self._sp.devices().get("devices", [])
         return devs[0]["id"] if devs else None
 
+    @Slot()
+    def loadDevices(self):
+        def task():
+            devs = self._sp.devices().get("devices", [])
+            out = [{
+                "id": d.get("id", ""),
+                "name": d.get("name", ""),
+                "type": d.get("type", ""),
+                "isActive": d.get("is_active", False),
+                "volume": d.get("volume_percent", 0) or 0,
+            } for d in devs]
+            self.devicesLoaded.emit(out)
+        self._submit(task)
+
+    @Slot(str)
+    def transferPlayback(self, device_id):
+        def task():
+            # keep playing on the new device if something was already playing
+            pb = self._sp.current_playback()
+            self._sp.transfer_playback(device_id, force_play=bool(pb and pb.get("is_playing")))
+            self.toast.emit("Switched device")
+            self._submit(self._now_playing_task)
+        self._submit(task)
+
     @Slot(str, str)
     def playTrack(self, uri, context_uri):
         self._submit(self._play_task, uri, context_uri)
@@ -238,13 +263,23 @@ class Backend(QObject):
 
     def _now_playing_task(self):
         pb = self._sp.current_playback()
+        dev = (pb or {}).get("device") or {}
+        # device info travels with every update so the UI can show where audio
+        # is routed even when no track is visible (idle, or a private session)
+        base = {
+            "deviceId": dev.get("id", ""),
+            "deviceName": dev.get("name", ""),
+            "deviceType": dev.get("type", ""),
+            "private": bool(dev.get("is_private_session")),
+        }
         if not pb or not pb.get("item"):
-            self.nowPlaying.emit({"active": False})
+            self.nowPlaying.emit({**base, "active": False})
             return
         t = pb["item"]
         album = t.get("album") or {}
         liked = self._saved_contains([t["id"]])[0] if t.get("id") else False
         self.nowPlaying.emit({
+            **base,
             "active": True,
             "isPlaying": pb.get("is_playing", False),
             "id": t.get("id", ""),
