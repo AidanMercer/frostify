@@ -1,20 +1,26 @@
 import hashlib
 import json
+import subprocess
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
+from PySide6.QtDBus import QDBusConnection, QDBusInterface
 from spotipy.exceptions import SpotifyException
 
 from .auth import make_auth, make_client
 from .config import DATA_CACHE_DIR
 
-# how long cached data is trusted before we bother the API again (seconds).
-# within these windows, reopening/re-searching costs zero network calls.
-TTL_PLAYLISTS = 1800   # sidebar — rarely changes
-TTL_TRACKS = 900       # a playlist's tracks
-TTL_SEARCH = 3600      # identical query → reuse results for an hour
+TTL_PLAYLISTS = 1800
+TTL_TRACKS = 900
+TTL_SEARCH = 3600
+
+_MPRIS_PATH = "/org/mpris/MediaPlayer2"
+_PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
+# how often to re-read full state from spotifyd over D-Bus. It's local IPC with no
+# rate limit, so this is cheap; in-between ticks interpolate the progress bar locally.
+_SYNC_EVERY = 2   # seconds (== ticks, since the timer is 1s)
 
 
 def _img(images, smallest=False):
@@ -23,50 +29,233 @@ def _img(images, smallest=False):
     return images[-1]["url"] if smallest else images[0]["url"]
 
 
+def _json_val(node):
+    """Recursively strip busctl --json `{"type","data"}` wrappers into plain Python."""
+    if isinstance(node, dict):
+        if len(node) == 2 and "type" in node and "data" in node:
+            return _json_val(node["data"])
+        return {k: _json_val(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [_json_val(v) for v in node]
+    return node
+
+
 class Backend(QObject):
     loggedInChanged = Signal(bool)
     playlistsLoaded = Signal(list)
     tracksLoaded = Signal(list, str)
     searchLoaded = Signal(list)
     nowPlaying = Signal("QVariant")
-    devicesLoaded = Signal(list)
+    devicesLoaded = Signal(list)   # kept for QML compat; no longer used
     error = Signal(str)
     toast = Signal(str)
 
     def __init__(self):
         super().__init__()
-        # one worker so spotipy's requests session is never touched concurrently
+        # one worker thread for all Web API calls
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._auth = make_auth()
         self._sp = make_client(self._auth)
-        # when Spotify rate-limits us (429), back off until this monotonic time;
-        # escalate the wait on repeated hits and only nag the user once per episode
-        self._backoff_until = 0.0
-        self._rl_strikes = 0
-        self._rl_notified = False
-        # remember the now-playing track's liked state so we only hit the
-        # "is it saved?" endpoint when the track actually changes, not every poll
+
+        # now-playing state. Full state is re-read from spotifyd over D-Bus every
+        # _SYNC_EVERY seconds; between reads the progress bar is interpolated locally.
         self._np_id = None
         self._np_liked = False
+        self._np_track_path = ""       # mpris:trackid (object path) for SetPosition
+        self._local_np = None          # last full nowPlaying dict
+        self._np_playing_since = 0.0   # monotonic: (now - since)*1000 = progressMs
+        self._np_duration_ms = 0
+        self._spotifyd_device_id = None  # cached Spotify Connect device ID
+        self._tick = 0
+
+        # 1s timer — drives both local interpolation and the periodic D-Bus re-read
         self._timer = QTimer(self)
-        # poll gently — 4s is plenty for a now-playing bar and keeps us well
-        # under Spotify's request limits over a long-running session
-        self._timer.setInterval(4000)
-        self._timer.timeout.connect(lambda: self._submit(self._now_playing_task))
+        self._timer.setInterval(1000)
+        self._timer.timeout.connect(self._on_tick)
+
+        # D-Bus: used only to SEND commands (PlayPause/Next/Previous). Reads go through
+        # busctl --json because PySide6's QDBusArgument can't demarshal MPRIS's a{sv} maps.
+        self._bus = QDBusConnection.sessionBus()
+        self._service = ""
+        self._player = None
+
         for sub in ("tracks", "search"):
             (DATA_CACHE_DIR / sub).mkdir(parents=True, exist_ok=True)
 
-    # ---- disk cache (timestamped: serve instantly, refresh only when stale) ----
+    # ---- spotifyd discovery / control (D-Bus, local IPC, no rate limits) ----
+
+    def _rebind(self):
+        """Find spotifyd's live MPRIS bus name and bind the control interface.
+        spotifyd only registers the name once it becomes the active device, and the
+        name carries a per-process .instanceNNN suffix, so we discover it each time.
+        Returns True when spotifyd is present."""
+        reply = QDBusInterface(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus", self._bus,
+        ).call("ListNames")
+        names = reply.arguments()[0] if reply.arguments() else []
+        svc = next((str(n) for n in names
+                    if str(n).startswith("org.mpris.MediaPlayer2.spotifyd")), "")
+        if not svc:
+            self._service, self._player = "", None
+            return False
+        if svc != self._service:
+            self._service = svc
+            self._player = QDBusInterface(svc, _MPRIS_PATH, _PLAYER_IFACE, self._bus)
+        return True
+
+    def _control(self, method, *args):
+        """Send a no-/typed-arg MPRIS command, then re-sync shortly after so the UI
+        reflects the new state without waiting for the next periodic read."""
+        if self._rebind():
+            self._player.call(method, *args)
+        QTimer.singleShot(150, self._sync)
+
+    def _read_state(self):
+        """Read full now-playing state from spotifyd via busctl --json (clean demarshalling)."""
+        if not self._rebind():
+            return {"active": False}
+        cmd = ["busctl", "--user", "--json=short", "get-property",
+               self._service, _MPRIS_PATH, _PLAYER_IFACE,
+               "PlaybackStatus", "Metadata", "Position"]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+        except Exception:
+            return {"active": False}
+        if res.returncode != 0:
+            self._service = ""  # likely gone — rediscover next time
+            return {"active": False}
+
+        vals = {}
+        for name, line in zip(("PlaybackStatus", "Metadata", "Position"),
+                              res.stdout.strip().splitlines()):
+            try:
+                vals[name] = _json_val(json.loads(line))
+            except Exception:
+                vals[name] = None
+
+        status = vals.get("PlaybackStatus") or "Stopped"
+        meta   = vals.get("Metadata") or {}
+        try:
+            pos_us = int(vals.get("Position") or 0)
+        except (ValueError, TypeError):
+            pos_us = 0
+
+        is_playing = status == "Playing"
+        if status not in ("Playing", "Paused") or not meta:
+            return {"active": False}
+
+        track_path = str(meta.get("mpris:trackid") or "")
+        url        = str(meta.get("xesam:url") or "")
+        name       = str(meta.get("xesam:title") or "")
+        artists    = meta.get("xesam:artist") or []
+        artist     = ", ".join(artists) if isinstance(artists, list) else str(artists)
+        album      = str(meta.get("xesam:album") or "")
+        image      = str(meta.get("mpris:artUrl") or "")
+        try:
+            dur_us = int(meta.get("mpris:length", 0) or 0)
+        except (ValueError, TypeError):
+            dur_us = 0
+
+        # the bare Spotify ID lives in the url ("spotify:track:XXX") or trackid path
+        # ("/spotify/track/XXX"); we need it for the liked-status check
+        if url.startswith("spotify:track:"):
+            track_id = url.split(":")[-1]
+        elif "/track/" in track_path:
+            track_id = track_path.rsplit("/", 1)[-1]
+        else:
+            track_id = ""
+        uri = url or (f"spotify:track:{track_id}" if track_id else "")
+
+        progress_ms = pos_us // 1000
+        duration_ms = dur_us // 1000
+
+        self._np_track_path = track_path
+        self._np_duration_ms = duration_ms
+        if is_playing:
+            self._np_playing_since = time.monotonic() - (progress_ms / 1000)
+
+        return {
+            "active":     True,
+            "isPlaying":  is_playing,
+            "id":         track_id,
+            "uri":        uri,
+            "name":       name,
+            "artist":     artist,
+            "album":      album,
+            "image":      image,
+            "progressMs": progress_ms,
+            "durationMs": duration_ms,
+            "liked":      False,
+        }
+
+    def _sync(self):
+        """Re-read full state from spotifyd, emit it, and refresh liked status on track change."""
+        data = self._read_state()
+        if data.get("active"):
+            tid = data.get("id", "")
+            if tid and tid == self._np_id:
+                data["liked"] = self._np_liked        # carry forward known liked state
+            elif tid:
+                self._np_id = tid
+                self._submit(self._check_liked_task, tid)
+        else:
+            self._np_id = None
+        self._local_np = data
+        self.nowPlaying.emit(data)
+
+    def _check_liked_task(self, tid):
+        """Worker: ask Spotify if the current track is liked, then update the UI."""
+        try:
+            liked = self._sp.current_user_saved_tracks_contains([tid])[0] if tid else False
+        except Exception:
+            liked = False
+        self._np_liked = liked
+        snap = self._local_np
+        if snap and snap.get("id") == tid:
+            data = {**snap, "liked": liked}
+            self._local_np = data
+            self.nowPlaying.emit(data)
+
+    # ---- timer: periodic D-Bus re-read + local progress interpolation ----
+
+    def _on_tick(self):
+        self._tick += 1
+        if self._tick % _SYNC_EVERY == 0:
+            self._sync()          # cheap local D-Bus read; catches track/status changes
+            return
+        snap = self._local_np     # in-between: interpolate the bar, no I/O
+        if not snap or not snap.get("active") or not snap.get("isPlaying"):
+            return
+        progress = min(int((time.monotonic() - self._np_playing_since) * 1000),
+                       self._np_duration_ms)
+        self.nowPlaying.emit({**snap, "progressMs": progress})
+
+    # ---- threading helpers ----
+
+    def _submit(self, fn, *args):
+        self._pool.submit(self._guard, fn, *args)
+
+    def _guard(self, fn, *args):
+        try:
+            fn(*args)
+        except SpotifyException as e:
+            traceback.print_exc()
+            self.error.emit(str(e))
+        except Exception as e:
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+    # ---- disk cache ----
+
     def _cache_get(self, name, ttl):
-        """Return (data, is_fresh). data is None when nothing is cached;
-        is_fresh is True when the entry is younger than ttl seconds."""
         try:
             p = DATA_CACHE_DIR / name
             if p.exists():
                 obj = json.loads(p.read_text())
                 if isinstance(obj, dict) and "ts" in obj and "data" in obj:
                     return obj["data"], (time.time() - obj["ts"]) < ttl
-                return obj, False  # legacy bare payload — treat as stale
+                return obj, False
         except Exception:
             pass
         return None, False
@@ -83,46 +272,8 @@ class Backend(QObject):
         except Exception:
             pass
 
-    # ---- threading helpers ----
-    def _submit(self, fn, *args):
-        self._pool.submit(self._guard, fn, *args)
-
-    def _guard(self, fn, *args):
-        try:
-            fn(*args)
-        except SpotifyException as e:
-            if e.http_status == 429:
-                self._on_rate_limited(e)
-                return
-            traceback.print_exc()
-            self.error.emit(str(e))
-        except Exception as e:  # surface anything to the UI instead of dying silently
-            traceback.print_exc()
-            self.error.emit(str(e))
-
-    def _on_rate_limited(self, e):
-        try:
-            header_retry = int(e.headers.get("Retry-After", "0")) if e.headers else 0
-        except (ValueError, TypeError):
-            header_retry = 0
-        self._rl_strikes += 1
-        # escalate so we stop poking a banned API every few seconds, but CAP the
-        # wait: a Retry-After can be hours, and honouring it literally would lock
-        # us out long after the ban actually lifts. Better to re-probe every few
-        # minutes — if still banned we just back off again.
-        backoff = max(header_retry, 15 * (2 ** min(self._rl_strikes, 6)))
-        backoff = min(backoff, 300)
-        self._backoff_until = time.monotonic() + backoff
-        # surface it in the status bar instead of repeated toasts
-        self.nowPlaying.emit({"active": False, "rateLimited": True})
-        if not self._rl_notified:   # one toast per ban episode
-            self._rl_notified = True
-            mins = max(1, round(backoff / 60))
-            when = f"~{mins} min" if backoff < 5400 else f"~{round(backoff / 3600, 1)} h"
-            self.toast.emit(f"Spotify rate-limited this app — pausing API calls for {when}. "
-                            "Usually clears on its own; just leave it open.")
-
     # ---- auth ----
+
     @Slot()
     def checkLogin(self):
         def task():
@@ -133,28 +284,26 @@ class Backend(QObject):
     @Slot()
     def login(self):
         def task():
-            self._auth.get_access_token()  # opens browser + tiny local server, then caches
+            self._auth.get_access_token()
             self.loggedInChanged.emit(True)
         self._submit(task)
 
     @Slot()
     def startPolling(self):
-        # called from QML (main thread) after login, so the timer starts in the right thread
         self._timer.start()
-        self._submit(self._now_playing_task)
+        self._sync()   # show whatever spotifyd is already playing (if anything)
 
     @Slot(bool)
     def setActive(self, active):
-        # pause polling while the window is unfocused — no point refreshing the
-        # now-playing bar nobody's looking at. Refresh once the moment we're back.
         if active:
             if not self._timer.isActive():
                 self._timer.start()
-            self._submit(self._now_playing_task)
+            self._sync()   # re-anchor on refocus so the bar doesn't jump
         else:
             self._timer.stop()
 
     # ---- library / browse ----
+
     @Slot()
     def loadPlaylists(self):
         self._submit(self._playlists_task)
@@ -168,7 +317,7 @@ class Backend(QObject):
         if cached is not None:
             self.playlistsLoaded.emit(cached)
             if fresh and not force:
-                return  # cache still good — don't touch the API
+                return
         out = []
         res = self._sp.current_user_playlists(limit=50)
         while res:
@@ -176,9 +325,9 @@ class Backend(QObject):
                 if not p or not p.get("id"):
                     continue
                 out.append({
-                    "id": p["id"],
-                    "uri": p.get("uri", ""),
-                    "name": p.get("name", "Untitled"),
+                    "id":    p["id"],
+                    "uri":   p.get("uri", ""),
+                    "name":  p.get("name", "Untitled"),
                     "image": _img(p.get("images")),
                     "count": (p.get("tracks") or {}).get("total", 0),
                     "owner": (p.get("owner") or {}).get("display_name", ""),
@@ -186,7 +335,7 @@ class Backend(QObject):
             res = self._sp.next(res) if res.get("next") else None
         if out != cached:
             self.playlistsLoaded.emit(out)
-        self._cache_write("playlists.json", out)  # always bump the timestamp
+        self._cache_write("playlists.json", out)
 
     @Slot(str, str, str)
     def openPlaylist(self, playlist_id, name, context_uri):
@@ -202,7 +351,7 @@ class Backend(QObject):
         if cached is not None:
             self.tracksLoaded.emit(cached, name)
             if fresh and not force:
-                return  # cache still good — don't touch the API
+                return
         raw = []
         try:
             res = self._sp.playlist_items(playlist_id, limit=100, additional_types=["track"])
@@ -210,23 +359,20 @@ class Backend(QObject):
                 raw += res["items"]
                 res = self._sp.next(res) if res.get("next") else None
         except SpotifyException as e:
-            # Spotify blocks Web API access to its own algorithmic/editorial
-            # playlists (Discover Weekly, Daily Mix, Release Radar, …)
             if e.http_status in (403, 404):
-                if cached is None:  # nothing to show — explain why
+                if cached is None:
                     self.tracksLoaded.emit([], name)
                     self.toast.emit("Spotify won't share this playlist's tracks — "
                                     "it's one of their editorial/algorithmic playlists.")
                 return
             raise
-        # some API/spotipy versions return the track under "item" instead of "track"
         tracks = [(r.get("track") or r.get("item")) for r in raw]
         tracks = [t for t in tracks if t and t.get("id")]
-        liked = self._saved_contains([t["id"] for t in tracks])
-        out = [self._track_dict(t, lk, context_uri) for t, lk in zip(tracks, liked)]
+        liked  = self._saved_contains([t["id"] for t in tracks])
+        out    = [self._track_dict(t, lk, context_uri) for t, lk in zip(tracks, liked)]
         if out != cached:
             self.tracksLoaded.emit(out, name)
-        self._cache_write(key, out)  # always bump the timestamp
+        self._cache_write(key, out)
 
     @Slot(str)
     def search(self, query):
@@ -244,18 +390,18 @@ class Backend(QObject):
         key = "search/" + hashlib.md5(q.lower().encode()).hexdigest() + ".json"
         cached, fresh = self._cache_get(key, TTL_SEARCH)
         if cached is not None and fresh and not force:
-            self.searchLoaded.emit(cached)  # identical query seen recently — reuse
+            self.searchLoaded.emit(cached)
             return
-        # Spotify now caps search limit at 10, so page through it for more results
         tracks = []
         for offset in (0, 10, 20, 30):
-            res = self._sp.search(q=q, type="track", limit=10, offset=offset)
+            res   = self._sp.search(q=q, type="track", limit=10, offset=offset)
             items = res["tracks"]["items"]
             tracks += [t for t in items if t.get("id")]
             if len(items) < 10:
                 break
-        liked = dict(zip([t["id"] for t in tracks], self._saved_contains([t["id"] for t in tracks])))
-        out = [self._track_dict(t, liked.get(t["id"], False), "") for t in tracks]
+        ids   = [t["id"] for t in tracks]
+        liked = dict(zip(ids, self._saved_contains(ids)))
+        out   = [self._track_dict(t, liked.get(t["id"], False), "") for t in tracks]
         self.searchLoaded.emit(out)
         self._cache_write(key, out)
 
@@ -268,86 +414,80 @@ class Backend(QObject):
     def _track_dict(self, t, liked, context_uri):
         album = t.get("album") or {}
         return {
-            "id": t["id"],
-            "uri": t["uri"],
-            "name": t["name"],
-            "artist": ", ".join(a["name"] for a in t.get("artists", [])),
-            "album": album.get("name", ""),
-            "image": _img(album.get("images"), smallest=True),
+            "id":         t["id"],
+            "uri":        t["uri"],
+            "name":       t["name"],
+            "artist":     ", ".join(a["name"] for a in t.get("artists", [])),
+            "album":      album.get("name", ""),
+            "image":      _img(album.get("images"), smallest=True),
             "durationMs": t.get("duration_ms", 0),
-            "liked": bool(liked),
+            "liked":      bool(liked),
             "contextUri": context_uri,
         }
 
     # ---- playback ----
-    def _device_id(self):
-        pb = self._sp.current_playback()
-        if pb and pb.get("device"):
-            return pb["device"]["id"]
+    # Play/pause/skip/seek go through MPRIS (local D-Bus, no network, no rate limits).
+    # Playing a specific track still uses start_playback() so playlist context is preserved —
+    # that call is user-triggered (rare) so it will never cause rate-limit issues.
+
+    def _spotifyd_device(self):
+        """Return spotifyd's Spotify Connect device ID, queried once per session."""
+        if self._spotifyd_device_id:
+            return self._spotifyd_device_id
         devs = self._sp.devices().get("devices", [])
+        # prefer devices named "frostify" or "spotifyd" (both are us); fall back to any Computer
+        for d in devs:
+            if d.get("name", "").lower() in ("frostify", "spotifyd"):
+                self._spotifyd_device_id = d["id"]
+                return d["id"]
+        for d in devs:
+            if d.get("type", "").lower() == "computer":
+                self._spotifyd_device_id = d["id"]
+                return d["id"]
         return devs[0]["id"] if devs else None
-
-    @Slot()
-    def loadDevices(self):
-        def task():
-            devs = self._sp.devices().get("devices", [])
-            out = [{
-                "id": d.get("id", ""),
-                "name": d.get("name", ""),
-                "type": d.get("type", ""),
-                "isActive": d.get("is_active", False),
-                "volume": d.get("volume_percent", 0) or 0,
-            } for d in devs]
-            self.devicesLoaded.emit(out)
-        self._submit(task)
-
-    @Slot(str)
-    def transferPlayback(self, device_id):
-        def task():
-            # keep playing on the new device if something was already playing
-            pb = self._sp.current_playback()
-            self._sp.transfer_playback(device_id, force_play=bool(pb and pb.get("is_playing")))
-            self.toast.emit("Switched device")
-            self._submit(self._now_playing_task)
-        self._submit(task)
 
     @Slot(str, str)
     def playTrack(self, uri, context_uri):
         self._submit(self._play_task, uri, context_uri)
 
     def _play_task(self, uri, context_uri):
-        dev = self._device_id()
+        dev = self._spotifyd_device()
         if not dev:
-            self.error.emit("No Spotify device found — open the Spotify app and play any song once.")
+            self.error.emit("spotifyd device not found — is spotifyd running?")
             return
         if context_uri:
             self._sp.start_playback(device_id=dev, context_uri=context_uri, offset={"uri": uri})
         else:
             self._sp.start_playback(device_id=dev, uris=[uri])
-        self._submit(self._now_playing_task)
 
     @Slot()
     def togglePlay(self):
-        def task():
-            pb = self._sp.current_playback()
-            if pb and pb.get("is_playing"):
-                self._sp.pause_playback()
-            else:
-                self._sp.start_playback()
-            self._submit(self._now_playing_task)
-        self._submit(task)
+        self._control("PlayPause")
 
     @Slot()
     def nextTrack(self):
-        self._submit(lambda: (self._sp.next_track(), self._submit(self._now_playing_task)))
+        self._control("Next")
 
     @Slot()
     def prevTrack(self):
-        self._submit(lambda: (self._sp.previous_track(), self._submit(self._now_playing_task)))
+        self._control("Previous")
 
     @Slot(int)
     def seek(self, ms):
-        self._submit(lambda: self._sp.seek_track(max(0, ms)))
+        # SetPosition(o trackId, x position_us) — the trackid is a D-Bus object path,
+        # which QDBusInterface.call() would send as a plain string and spotifyd rejects.
+        # busctl lets us specify the 'ox' signature explicitly.
+        if not self._np_track_path or not self._rebind():
+            return
+        try:
+            subprocess.run(
+                ["busctl", "--user", "call", self._service, _MPRIS_PATH, _PLAYER_IFACE,
+                 "SetPosition", "ox", self._np_track_path, str(max(0, ms) * 1000)],
+                capture_output=True, timeout=2,
+            )
+        except Exception:
+            pass
+        QTimer.singleShot(150, self._sync)
 
     @Slot(str, bool)
     def toggleLike(self, track_id, like):
@@ -356,8 +496,13 @@ class Backend(QObject):
                 self._sp.current_user_saved_tracks_add([track_id])
             else:
                 self._sp.current_user_saved_tracks_delete([track_id])
-            if track_id == self._np_id:   # keep the now-playing cache honest
+            if track_id == self._np_id:
                 self._np_liked = like
+                snap = self._local_np
+                if snap:
+                    data = {**snap, "liked": like}
+                    self._local_np = data
+                    self.nowPlaying.emit(data)
             self.toast.emit("Liked" if like else "Removed from liked")
         self._submit(task)
 
@@ -365,50 +510,14 @@ class Backend(QObject):
     def addToPlaylist(self, track_uri, playlist_id):
         def task():
             self._sp.playlist_add_items(playlist_id, [track_uri])
-            self._cache_delete(f"tracks/{playlist_id}.json")  # so reopen shows it
+            self._cache_delete(f"tracks/{playlist_id}.json")
             self.toast.emit("Added to playlist")
         self._submit(task)
 
-    def _now_playing_task(self):
-        if time.monotonic() < self._backoff_until:
-            return  # rate-limited — skip the poll rather than pile on more 429s
-        pb = self._sp.current_playback()
-        self._rl_strikes = 0          # a real call got through — ban has lifted
-        self._rl_notified = False
-        dev = (pb or {}).get("device") or {}
-        # device info travels with every update so the UI can show where audio
-        # is routed even when no track is visible (idle, or a private session)
-        base = {
-            "deviceId": dev.get("id", ""),
-            "deviceName": dev.get("name", ""),
-            "deviceType": dev.get("type", ""),
-            "private": bool(dev.get("is_private_session")),
-        }
-        if not pb or not pb.get("item"):
-            self.nowPlaying.emit({**base, "active": False})
-            return
-        t = pb["item"]
-        album = t.get("album") or {}
-        # only ask Spotify whether it's liked when the track changed
-        tid = t.get("id", "")
-        if tid and tid == self._np_id:
-            liked = self._np_liked
-        elif tid:
-            liked = self._saved_contains([tid])[0]
-            self._np_id, self._np_liked = tid, liked
-        else:
-            liked = False
-        self.nowPlaying.emit({
-            **base,
-            "active": True,
-            "isPlaying": pb.get("is_playing", False),
-            "id": t.get("id", ""),
-            "uri": t.get("uri", ""),
-            "name": t.get("name", ""),
-            "artist": ", ".join(a["name"] for a in t.get("artists", [])),
-            "album": album.get("name", ""),
-            "image": _img(album.get("images")),
-            "progressMs": pb.get("progress_ms", 0),
-            "durationMs": t.get("duration_ms", 0),
-            "liked": bool(liked),
-        })
+    @Slot()
+    def loadDevices(self):
+        pass  # spotifyd is the device; picker not needed
+
+    @Slot(str)
+    def transferPlayback(self, device_id):
+        pass

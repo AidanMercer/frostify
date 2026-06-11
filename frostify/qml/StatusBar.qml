@@ -76,34 +76,15 @@ Item {
         anchors.verticalCenter: parent.verticalCenter
         spacing: 8
 
-        // device badge — shows where audio is playing; click to switch
         Rectangle {
             anchors.verticalCenter: parent.verticalCenter
-            height: 22; width: devRow.implicitWidth + 16; radius: Theme.radiusXs
-            color: devHover.hovered ? Theme.accentSoft : Theme.badge
-            border.color: devHover.hovered ? Theme.accent : "transparent"
-            border.width: 1
-            Behavior on color { ColorAnimation { duration: 120 } }
-            Row {
-                id: devRow
+            height: 22; width: spTxt.implicitWidth + 16; radius: Theme.radiusXs
+            color: Theme.badge
+            Text {
+                id: spTxt
                 anchors.centerIn: parent
-                spacing: 5
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: root.deviceGlyph(root.np.deviceType); font.pixelSize: 11
-                }
-                Text {
-                    anchors.verticalCenter: parent.verticalCenter
-                    text: root.np.deviceName ? root.np.deviceName : "no device"
-                    color: root.np.deviceName ? Theme.text : Theme.subtext
-                    font.pixelSize: 11; font.bold: true
-                }
-            }
-            HoverHandler { id: devHover }
-            MouseArea {
-                anchors.fill: parent
-                cursorShape: Qt.PointingHandCursor
-                onClicked: root.pickDevice()
+                text: "♫ frostify"
+                color: Theme.teal; font.pixelSize: 11; font.bold: true
             }
         }
 
