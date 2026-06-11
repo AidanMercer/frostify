@@ -1,3 +1,4 @@
+import hashlib
 import json
 import time
 import traceback
@@ -8,6 +9,12 @@ from spotipy.exceptions import SpotifyException
 
 from .auth import make_auth, make_client
 from .config import DATA_CACHE_DIR
+
+# how long cached data is trusted before we bother the API again (seconds).
+# within these windows, reopening/re-searching costs zero network calls.
+TTL_PLAYLISTS = 1800   # sidebar — rarely changes
+TTL_TRACKS = 900       # a playlist's tracks
+TTL_SEARCH = 3600      # identical query → reuse results for an hour
 
 
 def _img(images, smallest=False):
@@ -44,21 +51,33 @@ class Backend(QObject):
         # under Spotify's request limits over a long-running session
         self._timer.setInterval(4000)
         self._timer.timeout.connect(lambda: self._submit(self._now_playing_task))
-        (DATA_CACHE_DIR / "tracks").mkdir(parents=True, exist_ok=True)
+        for sub in ("tracks", "search"):
+            (DATA_CACHE_DIR / sub).mkdir(parents=True, exist_ok=True)
 
-    # ---- disk cache (show stale instantly, refresh in background) ----
-    def _cache_read(self, name):
+    # ---- disk cache (timestamped: serve instantly, refresh only when stale) ----
+    def _cache_get(self, name, ttl):
+        """Return (data, is_fresh). data is None when nothing is cached;
+        is_fresh is True when the entry is younger than ttl seconds."""
         try:
             p = DATA_CACHE_DIR / name
             if p.exists():
-                return json.loads(p.read_text())
+                obj = json.loads(p.read_text())
+                if isinstance(obj, dict) and "ts" in obj and "data" in obj:
+                    return obj["data"], (time.time() - obj["ts"]) < ttl
+                return obj, False  # legacy bare payload — treat as stale
         except Exception:
             pass
-        return None
+        return None, False
 
     def _cache_write(self, name, data):
         try:
-            (DATA_CACHE_DIR / name).write_text(json.dumps(data))
+            (DATA_CACHE_DIR / name).write_text(json.dumps({"ts": time.time(), "data": data}))
+        except Exception:
+            pass
+
+    def _cache_delete(self, name):
+        try:
+            (DATA_CACHE_DIR / name).unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -132,9 +151,11 @@ class Backend(QObject):
         self._submit(self._playlists_task)
 
     def _playlists_task(self):
-        cached = self._cache_read("playlists.json")
-        if cached:
+        cached, fresh = self._cache_get("playlists.json", TTL_PLAYLISTS)
+        if cached is not None:
             self.playlistsLoaded.emit(cached)
+            if fresh:
+                return  # cache still good — don't touch the API
         out = []
         res = self._sp.current_user_playlists(limit=50)
         while res:
@@ -152,7 +173,7 @@ class Backend(QObject):
             res = self._sp.next(res) if res.get("next") else None
         if out != cached:
             self.playlistsLoaded.emit(out)
-            self._cache_write("playlists.json", out)
+        self._cache_write("playlists.json", out)  # always bump the timestamp
 
     @Slot(str, str, str)
     def openPlaylist(self, playlist_id, name, context_uri):
@@ -160,9 +181,11 @@ class Backend(QObject):
 
     def _tracks_task(self, playlist_id, name, context_uri):
         key = f"tracks/{playlist_id}.json"
-        cached = self._cache_read(key)
-        if cached:
+        cached, fresh = self._cache_get(key, TTL_TRACKS)
+        if cached is not None:
             self.tracksLoaded.emit(cached, name)
+            if fresh:
+                return  # cache still good — don't touch the API
         raw = []
         try:
             res = self._sp.playlist_items(playlist_id, limit=100, additional_types=["track"])
@@ -173,9 +196,10 @@ class Backend(QObject):
             # Spotify blocks Web API access to its own algorithmic/editorial
             # playlists (Discover Weekly, Daily Mix, Release Radar, …)
             if e.http_status in (403, 404):
-                self.tracksLoaded.emit([], name)
-                self.toast.emit("Spotify won't share this playlist's tracks — "
-                                "it's one of their editorial/algorithmic playlists.")
+                if cached is None:  # nothing to show — explain why
+                    self.tracksLoaded.emit([], name)
+                    self.toast.emit("Spotify won't share this playlist's tracks — "
+                                    "it's one of their editorial/algorithmic playlists.")
                 return
             raise
         # some API/spotipy versions return the track under "item" instead of "track"
@@ -185,20 +209,26 @@ class Backend(QObject):
         out = [self._track_dict(t, lk, context_uri) for t, lk in zip(tracks, liked)]
         if out != cached:
             self.tracksLoaded.emit(out, name)
-            self._cache_write(key, out)
+        self._cache_write(key, out)  # always bump the timestamp
 
     @Slot(str)
     def search(self, query):
         self._submit(self._search_task, query)
 
     def _search_task(self, query):
-        if not query.strip():
+        q = query.strip()
+        if not q:
             self.searchLoaded.emit([])
+            return
+        key = "search/" + hashlib.md5(q.lower().encode()).hexdigest() + ".json"
+        cached, fresh = self._cache_get(key, TTL_SEARCH)
+        if cached is not None and fresh:
+            self.searchLoaded.emit(cached)  # identical query seen recently — reuse
             return
         # Spotify now caps search limit at 10, so page through it for more results
         tracks = []
         for offset in (0, 10, 20, 30):
-            res = self._sp.search(q=query, type="track", limit=10, offset=offset)
+            res = self._sp.search(q=q, type="track", limit=10, offset=offset)
             items = res["tracks"]["items"]
             tracks += [t for t in items if t.get("id")]
             if len(items) < 10:
@@ -206,6 +236,7 @@ class Backend(QObject):
         liked = dict(zip([t["id"] for t in tracks], self._saved_contains([t["id"] for t in tracks])))
         out = [self._track_dict(t, liked.get(t["id"], False), "") for t in tracks]
         self.searchLoaded.emit(out)
+        self._cache_write(key, out)
 
     def _saved_contains(self, ids):
         out = []
@@ -313,6 +344,7 @@ class Backend(QObject):
     def addToPlaylist(self, track_uri, playlist_id):
         def task():
             self._sp.playlist_add_items(playlist_id, [track_uri])
+            self._cache_delete(f"tracks/{playlist_id}.json")  # so reopen shows it
             self.toast.emit("Added to playlist")
         self._submit(task)
 
