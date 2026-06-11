@@ -4,27 +4,10 @@ Item {
     id: root
     property var np: ({ "active": false })
     property string position: "0/0"
-    signal pickDevice()
 
     function pct() {
         if (!np.active || !np.durationMs) return 0
         return Math.round(np.progressMs / np.durationMs * 100)
-    }
-
-    function deviceGlyph(type) {
-        switch (("" + type).toLowerCase()) {
-            case "computer":   return "💻"
-            case "smartphone": return "📱"
-            case "tablet":     return "📱"
-            case "speaker":    return "🔊"
-            case "tv":         return "📺"
-            case "castvideo":  return "📺"
-            case "avr":
-            case "stb":
-            case "gameconsole": return "🎮"
-            case "automobile": return "🚗"
-            default:           return "🔈"
-        }
     }
 
     // left: mode badge + transport

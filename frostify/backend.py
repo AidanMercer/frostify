@@ -18,9 +18,7 @@ TTL_SEARCH = 3600
 
 _MPRIS_PATH = "/org/mpris/MediaPlayer2"
 _PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
-# how often to re-read full state from spotifyd over D-Bus. It's local IPC with no
-# rate limit, so this is cheap; in-between ticks interpolate the progress bar locally.
-_SYNC_EVERY = 2   # seconds (== ticks, since the timer is 1s)
+_SYNC_EVERY = 2   # re-read spotifyd every N timer ticks; interpolate in between
 
 
 def _img(images, smallest=False):
@@ -30,7 +28,7 @@ def _img(images, smallest=False):
 
 
 def _json_val(node):
-    """Recursively strip busctl --json `{"type","data"}` wrappers into plain Python."""
+    """Unwrap busctl --json `{"type","data"}` nodes into plain values."""
     if isinstance(node, dict):
         if len(node) == 2 and "type" in node and "data" in node:
             return _json_val(node["data"])
@@ -46,36 +44,32 @@ class Backend(QObject):
     tracksLoaded = Signal(list, str)
     searchLoaded = Signal(list)
     nowPlaying = Signal("QVariant")
-    devicesLoaded = Signal(list)   # kept for QML compat; no longer used
     error = Signal(str)
     toast = Signal(str)
 
     def __init__(self):
         super().__init__()
-        # one worker thread for all Web API calls
+        # single worker so spotipy's session is never touched concurrently
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._auth = make_auth()
         self._sp = make_client(self._auth)
 
-        # now-playing state. Full state is re-read from spotifyd over D-Bus every
-        # _SYNC_EVERY seconds; between reads the progress bar is interpolated locally.
         self._np_id = None
         self._np_liked = False
-        self._np_track_path = ""       # mpris:trackid (object path) for SetPosition
-        self._local_np = None          # last full nowPlaying dict
-        self._np_playing_since = 0.0   # monotonic: (now - since)*1000 = progressMs
+        self._np_track_path = ""       # mpris:trackid, needed for SetPosition
+        self._local_np = None
+        self._np_playing_since = 0.0   # monotonic anchor for interpolating progress
         self._np_duration_ms = 0
-        self._spotifyd_device_id = None  # cached Spotify Connect device ID
-        self._user_id = None             # cached Spotify user id (for creating playlists)
+        self._spotifyd_device_id = None
+        self._user_id = None
         self._tick = 0
 
-        # 1s timer — drives both local interpolation and the periodic D-Bus re-read
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
         self._timer.timeout.connect(self._on_tick)
 
-        # D-Bus: used only to SEND commands (PlayPause/Next/Previous). Reads go through
-        # busctl --json because PySide6's QDBusArgument can't demarshal MPRIS's a{sv} maps.
+        # QtDBus is used to send commands; reads go through busctl --json since
+        # PySide6 can't demarshal MPRIS's a{sv} metadata maps.
         self._bus = QDBusConnection.sessionBus()
         self._service = ""
         self._player = None
@@ -83,13 +77,11 @@ class Backend(QObject):
         for sub in ("tracks", "search"):
             (DATA_CACHE_DIR / sub).mkdir(parents=True, exist_ok=True)
 
-    # ---- spotifyd discovery / control (D-Bus, local IPC, no rate limits) ----
+    # ---- spotifyd playback over D-Bus ----
 
     def _rebind(self):
-        """Find spotifyd's live MPRIS bus name and bind the control interface.
-        spotifyd only registers the name once it becomes the active device, and the
-        name carries a per-process .instanceNNN suffix, so we discover it each time.
-        Returns True when spotifyd is present."""
+        # spotifyd only claims its MPRIS name while it's the active device, and the
+        # name carries a per-process suffix, so look it up fresh each time.
         reply = QDBusInterface(
             "org.freedesktop.DBus", "/org/freedesktop/DBus",
             "org.freedesktop.DBus", self._bus,
@@ -106,14 +98,11 @@ class Backend(QObject):
         return True
 
     def _control(self, method, *args):
-        """Send a no-/typed-arg MPRIS command, then re-sync shortly after so the UI
-        reflects the new state without waiting for the next periodic read."""
         if self._rebind():
             self._player.call(method, *args)
-        QTimer.singleShot(150, self._sync)
+        QTimer.singleShot(150, self._sync)  # let spotifyd settle, then refresh the UI
 
     def _read_state(self):
-        """Read full now-playing state from spotifyd via busctl --json (clean demarshalling)."""
         if not self._rebind():
             return {"active": False}
         cmd = ["busctl", "--user", "--json=short", "get-property",
@@ -124,7 +113,7 @@ class Backend(QObject):
         except Exception:
             return {"active": False}
         if res.returncode != 0:
-            self._service = ""  # likely gone — rediscover next time
+            self._service = ""  # gone — rediscover next time
             return {"active": False}
 
         vals = {}
@@ -158,8 +147,7 @@ class Backend(QObject):
         except (ValueError, TypeError):
             dur_us = 0
 
-        # the bare Spotify ID lives in the url ("spotify:track:XXX") or trackid path
-        # ("/spotify/track/XXX"); we need it for the liked-status check
+        # bare track id from the url ("spotify:track:X") or trackid path ("/spotify/track/X")
         if url.startswith("spotify:track:"):
             track_id = url.split(":")[-1]
         elif "/track/" in track_path:
@@ -191,12 +179,11 @@ class Backend(QObject):
         }
 
     def _sync(self):
-        """Re-read full state from spotifyd, emit it, and refresh liked status on track change."""
         data = self._read_state()
         if data.get("active"):
             tid = data.get("id", "")
             if tid and tid == self._np_id:
-                data["liked"] = self._np_liked        # carry forward known liked state
+                data["liked"] = self._np_liked        # already know it for this track
             elif tid:
                 self._np_id = tid
                 self._submit(self._check_liked_task, tid)
@@ -206,7 +193,6 @@ class Backend(QObject):
         self.nowPlaying.emit(data)
 
     def _check_liked_task(self, tid):
-        """Worker: ask Spotify if the current track is liked, then update the UI."""
         try:
             liked = self._sp.current_user_saved_tracks_contains([tid])[0] if tid else False
         except Exception:
@@ -218,14 +204,12 @@ class Backend(QObject):
             self._local_np = data
             self.nowPlaying.emit(data)
 
-    # ---- timer: periodic D-Bus re-read + local progress interpolation ----
-
     def _on_tick(self):
         self._tick += 1
         if self._tick % _SYNC_EVERY == 0:
-            self._sync()          # cheap local D-Bus read; catches track/status changes
+            self._sync()
             return
-        snap = self._local_np     # in-between: interpolate the bar, no I/O
+        snap = self._local_np
         if not snap or not snap.get("active") or not snap.get("isPlaying"):
             return
         progress = min(int((time.monotonic() - self._np_playing_since) * 1000),
@@ -338,7 +322,7 @@ class Backend(QObject):
             self.playlistsLoaded.emit(self._apply_pins(out))
         self._cache_write("playlists.json", out)  # cache the raw (unpinned) order
 
-    # ---- pinning (local only — Spotify's API doesn't expose its pin feature) ----
+    # ---- pinning (local only — Spotify has no pin API) ----
 
     def _load_pinned(self):
         try:
@@ -352,8 +336,7 @@ class Backend(QObject):
         return []
 
     def _apply_pins(self, playlists):
-        """Tag each playlist with `pinned` and float pinned ones to the top,
-        in pin order; everything else keeps its original order (stable sort)."""
+        # pinned playlists float to the top in pin order; the rest keep their order
         pinned = self._load_pinned()
         rank = {pid: i for i, pid in enumerate(pinned)}
         decorated = [{**p, "pinned": p["id"] in rank} for p in playlists]
@@ -480,16 +463,13 @@ class Backend(QObject):
         }
 
     # ---- playback ----
-    # Play/pause/skip/seek go through MPRIS (local D-Bus, no network, no rate limits).
-    # Playing a specific track still uses start_playback() so playlist context is preserved —
-    # that call is user-triggered (rare) so it will never cause rate-limit issues.
+    # Transport runs over MPRIS; starting a specific track needs start_playback()
+    # so the playlist context carries over.
 
     def _spotifyd_device(self):
-        """Return spotifyd's Spotify Connect device ID, queried once per session."""
         if self._spotifyd_device_id:
             return self._spotifyd_device_id
         devs = self._sp.devices().get("devices", [])
-        # prefer devices named "frostify" or "spotifyd" (both are us); fall back to any Computer
         for d in devs:
             if d.get("name", "").lower() in ("frostify", "spotifyd"):
                 self._spotifyd_device_id = d["id"]
@@ -528,9 +508,7 @@ class Backend(QObject):
 
     @Slot(int)
     def seek(self, ms):
-        # SetPosition(o trackId, x position_us) — the trackid is a D-Bus object path,
-        # which QDBusInterface.call() would send as a plain string and spotifyd rejects.
-        # busctl lets us specify the 'ox' signature explicitly.
+        # via busctl so the trackid goes as an object path ('o'), not a string
         if not self._np_track_path or not self._rebind():
             return
         try:
@@ -567,11 +545,3 @@ class Backend(QObject):
             self._cache_delete(f"tracks/{playlist_id}.json")
             self.toast.emit("Added to playlist")
         self._submit(task)
-
-    @Slot()
-    def loadDevices(self):
-        pass  # spotifyd is the device; picker not needed
-
-    @Slot(str)
-    def transferPlayback(self, device_id):
-        pass

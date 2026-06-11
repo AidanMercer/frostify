@@ -18,7 +18,6 @@ ApplicationWindow {
     property string mode: "playlist"          // "playlist" | "search"
     property string openedName: ""
     property var np: ({ "active": false })
-    property var devices: []
     property var openedPlaylist: null
     property bool loggedIn: false
 
@@ -97,7 +96,6 @@ ApplicationWindow {
             win.mode = "search"; win.activePane = "tracks"; win.trCursor = 0
         }
         function onNowPlaying(data) { win.np = data }
-        function onDevicesLoaded(list) { win.devices = list }
         function onError(msg) { toast.show(msg, true) }
         function onToast(msg) { toast.show(msg, false) }
     }
@@ -254,13 +252,9 @@ ApplicationWindow {
                 position: win.activePane === "playlists"
                     ? (win.playlists.length ? (win.plCursor + 1) + "/" + win.playlists.length : "0/0")
                     : (win.curTracks().length ? (win.trCursor + 1) + "/" + win.curTracks().length : "0/0")
-                onPickDevice: { backend.loadDevices(); deviceMenu.visible = true }
             }
         }
     }
-
-    // ---- device picker overlay ----
-    DeviceMenu { id: deviceMenu; model: win.devices }
 
     // ---- login overlay ----
     Rectangle {
