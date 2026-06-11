@@ -1,4 +1,5 @@
 import json
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,8 +32,13 @@ class Backend(QObject):
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._auth = make_auth()
         self._sp = make_client(self._auth)
+        # when Spotify rate-limits us (429), back off until this monotonic time
+        self._backoff_until = 0.0
+        self._last_rl_toast = 0.0
         self._timer = QTimer(self)
-        self._timer.setInterval(1500)
+        # poll gently — 4s is plenty for a now-playing bar and keeps us well
+        # under Spotify's request limits over a long-running session
+        self._timer.setInterval(4000)
         self._timer.timeout.connect(lambda: self._submit(self._now_playing_task))
         (DATA_CACHE_DIR / "tracks").mkdir(parents=True, exist_ok=True)
 
@@ -59,9 +65,30 @@ class Backend(QObject):
     def _guard(self, fn, *args):
         try:
             fn(*args)
+        except SpotifyException as e:
+            if e.http_status == 429:
+                self._on_rate_limited(e)
+                return
+            traceback.print_exc()
+            self.error.emit(str(e))
         except Exception as e:  # surface anything to the UI instead of dying silently
             traceback.print_exc()
             self.error.emit(str(e))
+
+    def _on_rate_limited(self, e):
+        # Spotify hands back a Retry-After (seconds) — stop hitting the API until
+        # then so we don't dig the hole deeper, and tell the user once.
+        try:
+            retry = int(e.headers.get("Retry-After", "5")) if e.headers else 5
+        except (ValueError, TypeError):
+            retry = 5
+        self._backoff_until = time.monotonic() + retry
+        now = time.monotonic()
+        if now - self._last_rl_toast > 10:
+            self._last_rl_toast = now
+            mins = max(1, round(retry / 60))
+            when = f"~{mins} min" if retry < 5400 else f"~{round(retry / 3600, 1)} h"
+            self.toast.emit(f"Spotify rate-limited this app — backing off for {when}.")
 
     # ---- auth ----
     @Slot()
@@ -273,6 +300,8 @@ class Backend(QObject):
         self._submit(task)
 
     def _now_playing_task(self):
+        if time.monotonic() < self._backoff_until:
+            return  # rate-limited — skip the poll rather than pile on more 429s
         pb = self._sp.current_playback()
         dev = (pb or {}).get("device") or {}
         # device info travels with every update so the UI can show where audio
