@@ -64,6 +64,9 @@ ApplicationWindow {
 
     Component.onCompleted: backend.checkLogin()
 
+    // pause the now-playing poll when the window loses focus, resume on return
+    onActiveChanged: if (win.loggedIn) backend.setActive(win.active)
+
     Connections {
         target: backend
         function onLoggedInChanged(ok) {

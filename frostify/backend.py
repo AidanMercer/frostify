@@ -35,6 +35,10 @@ class Backend(QObject):
         # when Spotify rate-limits us (429), back off until this monotonic time
         self._backoff_until = 0.0
         self._last_rl_toast = 0.0
+        # remember the now-playing track's liked state so we only hit the
+        # "is it saved?" endpoint when the track actually changes, not every poll
+        self._np_id = None
+        self._np_liked = False
         self._timer = QTimer(self)
         # poll gently — 4s is plenty for a now-playing bar and keeps us well
         # under Spotify's request limits over a long-running session
@@ -110,6 +114,17 @@ class Backend(QObject):
         # called from QML (main thread) after login, so the timer starts in the right thread
         self._timer.start()
         self._submit(self._now_playing_task)
+
+    @Slot(bool)
+    def setActive(self, active):
+        # pause polling while the window is unfocused — no point refreshing the
+        # now-playing bar nobody's looking at. Refresh once the moment we're back.
+        if active:
+            if not self._timer.isActive():
+                self._timer.start()
+            self._submit(self._now_playing_task)
+        else:
+            self._timer.stop()
 
     # ---- library / browse ----
     @Slot()
@@ -289,6 +304,8 @@ class Backend(QObject):
                 self._sp.current_user_saved_tracks_add([track_id])
             else:
                 self._sp.current_user_saved_tracks_delete([track_id])
+            if track_id == self._np_id:   # keep the now-playing cache honest
+                self._np_liked = like
             self.toast.emit("Liked" if like else "Removed from liked")
         self._submit(task)
 
@@ -317,7 +334,15 @@ class Backend(QObject):
             return
         t = pb["item"]
         album = t.get("album") or {}
-        liked = self._saved_contains([t["id"]])[0] if t.get("id") else False
+        # only ask Spotify whether it's liked when the track changed
+        tid = t.get("id", "")
+        if tid and tid == self._np_id:
+            liked = self._np_liked
+        elif tid:
+            liked = self._saved_contains([tid])[0]
+            self._np_id, self._np_liked = tid, liked
+        else:
+            liked = False
         self.nowPlaying.emit({
             **base,
             "active": True,
