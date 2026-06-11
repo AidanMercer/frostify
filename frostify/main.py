@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QUrl, qInstallMessageHandler
-from PySide6.QtGui import QGuiApplication, QSurfaceFormat
+from PySide6.QtGui import QFont, QGuiApplication, QSurfaceFormat
 from PySide6.QtQml import QQmlApplicationEngine
 
 from . import config
@@ -41,6 +41,7 @@ def main():
     app = QGuiApplication(sys.argv)
     app.setApplicationName("frostify")
     app.setDesktopFileName("frostify")  # becomes the Wayland app_id Hyprland sees
+    app.setFont(QFont(THEME["font"]))   # monospace everywhere, yazi-style
 
     from .backend import Backend
     backend = Backend()

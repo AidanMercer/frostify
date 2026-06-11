@@ -1,19 +1,28 @@
-# frosted white glass palette. colors are #AARRGGBB strings (QML reads alpha-first hex).
+# dark frosted palette (tokyo-night-ish), yazi vibe. #AARRGGBB strings.
 THEME = {
-    "glass":        "#73ffffff",  # main panel ~45% white
-    "glassStrong":  "#a6ffffff",  # selected / active row
-    "glassSoft":    "#3dffffff",  # hover, art backing
-    "border":       "#59ffffff",
-    "divider":      "#22000000",
-    "text":         "#ff1d2126",
-    "subtext":      "#9a2c333a",
-    "accent":       "#ff35b87a",
-    "accentSoft":   "#3335b87a",
-    "errorBg":      "#e6c0392b",
-    "toastBg":      "#ecffffff",
+    "bg":          "#e61f2335",   # window base, ~90% dark navy (blur shows through)
+    "glassSoft":   "#14ffffff",   # hover
+    "sel":         "#ff7aa2f7",   # selection pill, active pane (periwinkle)
+    "selText":     "#ff1a1b26",   # text on active pill (dark)
+    "selDim":      "#3a7aa2f7",   # cursor pill when pane is inactive
+    "border":      "#30ffffff",
+    "divider":     "#1affffff",
+    "badge":       "#33ffffff",   # status-bar badge backing
 
-    "radius":    18,
-    "radiusSm":  12,
-    "radiusXs":  8,
-    "pad":       14,
+    "text":        "#ffc0caf5",   # light
+    "subtext":     "#ff7e87b0",
+    "teal":        "#ff7dcfff",   # playlist / "folder" color
+    "green":       "#ff9ece6a",   # sizes / durations
+    "accent":      "#ff7aa2f7",
+    "accentSoft":  "#337aa2f7",
+
+    "errorBg":     "#e6db4b4b",
+    "toastBg":     "#ee2a2e42",
+
+    "radius":    16,
+    "radiusSm":  10,
+    "radiusXs":  7,
+    "pad":       12,
+
+    "font":      "Adwaita Mono",
 }

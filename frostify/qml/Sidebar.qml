@@ -4,72 +4,55 @@ import QtQuick.Controls.Basic
 Item {
     id: root
     property var model: []
-    property string currentId: ""
-    signal opened(string id, string name, string uri)
+    property int cursor: 0
+    property bool active: false
+    signal clicked(int index)
+
+    onCursorChanged: if (active) lv.positionViewAtIndex(cursor, ListView.Contain)
 
     ListView {
+        id: lv
         anchors.fill: parent
-        anchors.margins: 8
+        anchors.margins: 6
         clip: true
-        spacing: 4
+        spacing: 2
         model: root.model
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
         delegate: Rectangle {
             required property var modelData
+            required property int index
             width: ListView.view.width
-            height: 54
+            height: 30
             radius: Theme.radiusSm
-            color: modelData.id === root.currentId ? Theme.glassStrong
+            color: index === root.cursor ? (root.active ? Theme.sel : Theme.selDim)
                  : (hover.hovered ? Theme.glassSoft : "transparent")
-            Behavior on color { ColorAnimation { duration: 120 } }
 
             HoverHandler { id: hover }
             MouseArea {
                 anchors.fill: parent
                 cursorShape: Qt.PointingHandCursor
-                onClicked: root.opened(modelData.id, modelData.name, modelData.uri)
+                onClicked: root.clicked(index)
             }
 
             Row {
                 anchors.fill: parent
-                anchors.margins: 8
-                spacing: 10
-
-                Rectangle {
-                    width: 38; height: 38
-                    radius: Theme.radiusXs
-                    color: Theme.glassSoft
-                    clip: true
-                    Image {
-                        anchors.fill: parent
-                        source: modelData.image
-                        fillMode: Image.PreserveAspectCrop
-                        visible: modelData.image !== ""
-                        asynchronous: true
-                    }
-                }
-
-                Column {
-                    width: parent.width - 48
+                anchors.leftMargin: 10
+                anchors.rightMargin: 8
+                spacing: 8
+                Text {
                     anchors.verticalCenter: parent.verticalCenter
-                    spacing: 2
-                    Text {
-                        text: modelData.name
-                        color: Theme.text
-                        font.pixelSize: 13
-                        font.bold: true
-                        elide: Text.ElideRight
-                        width: parent.width
-                    }
-                    Text {
-                        text: modelData.count > 0 ? (modelData.count + " tracks")
-                            : (modelData.owner !== "" ? modelData.owner : "playlist")
-                        color: Theme.subtext
-                        font.pixelSize: 11
-                        elide: Text.ElideRight
-                        width: parent.width
-                    }
+                    text: "♫"
+                    color: index === root.cursor && root.active ? Theme.selText : Theme.teal
+                    font.pixelSize: 13
+                }
+                Text {
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width - 28
+                    text: modelData.name
+                    color: index === root.cursor && root.active ? Theme.selText : Theme.text
+                    font.pixelSize: 13
+                    elide: Text.ElideRight
                 }
             }
         }

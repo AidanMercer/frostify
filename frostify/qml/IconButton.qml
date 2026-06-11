@@ -14,7 +14,7 @@ Item {
     Rectangle {
         anchors.fill: parent
         radius: width / 2
-        color: hh.hovered ? Theme.glassStrong : "transparent"
+        color: hh.hovered ? Theme.glassSoft : "transparent"
         Behavior on color { ColorAnimation { duration: 120 } }
     }
 
