@@ -1,9 +1,11 @@
+import json
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 from .auth import make_auth, make_client
+from .config import DATA_CACHE_DIR
 
 
 def _img(images, smallest=False):
@@ -30,6 +32,23 @@ class Backend(QObject):
         self._timer = QTimer(self)
         self._timer.setInterval(1500)
         self._timer.timeout.connect(lambda: self._submit(self._now_playing_task))
+        (DATA_CACHE_DIR / "tracks").mkdir(parents=True, exist_ok=True)
+
+    # ---- disk cache (show stale instantly, refresh in background) ----
+    def _cache_read(self, name):
+        try:
+            p = DATA_CACHE_DIR / name
+            if p.exists():
+                return json.loads(p.read_text())
+        except Exception:
+            pass
+        return None
+
+    def _cache_write(self, name, data):
+        try:
+            (DATA_CACHE_DIR / name).write_text(json.dumps(data))
+        except Exception:
+            pass
 
     # ---- threading helpers ----
     def _submit(self, fn, *args):
@@ -69,6 +88,9 @@ class Backend(QObject):
         self._submit(self._playlists_task)
 
     def _playlists_task(self):
+        cached = self._cache_read("playlists.json")
+        if cached:
+            self.playlistsLoaded.emit(cached)
         out = []
         res = self._sp.current_user_playlists(limit=50)
         while res:
@@ -84,13 +106,19 @@ class Backend(QObject):
                     "owner": (p.get("owner") or {}).get("display_name", ""),
                 })
             res = self._sp.next(res) if res.get("next") else None
-        self.playlistsLoaded.emit(out)
+        if out != cached:
+            self.playlistsLoaded.emit(out)
+            self._cache_write("playlists.json", out)
 
     @Slot(str, str, str)
     def openPlaylist(self, playlist_id, name, context_uri):
         self._submit(self._tracks_task, playlist_id, name, context_uri)
 
     def _tracks_task(self, playlist_id, name, context_uri):
+        key = f"tracks/{playlist_id}.json"
+        cached = self._cache_read(key)
+        if cached:
+            self.tracksLoaded.emit(cached, name)
         raw = []
         res = self._sp.playlist_items(playlist_id, limit=100, additional_types=["track"])
         while res:
@@ -101,7 +129,9 @@ class Backend(QObject):
         tracks = [t for t in tracks if t and t.get("id")]
         liked = self._saved_contains([t["id"] for t in tracks])
         out = [self._track_dict(t, lk, context_uri) for t, lk in zip(tracks, liked)]
-        self.tracksLoaded.emit(out, name)
+        if out != cached:
+            self.tracksLoaded.emit(out, name)
+            self._cache_write(key, out)
 
     @Slot(str)
     def search(self, query):

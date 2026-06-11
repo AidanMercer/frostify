@@ -3,7 +3,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QUrl, qInstallMessageHandler
 from PySide6.QtGui import QFont, QGuiApplication, QSurfaceFormat
-from PySide6.QtQml import QQmlApplicationEngine
+from PySide6.QtNetwork import QNetworkAccessManager, QNetworkDiskCache
+from PySide6.QtQml import QQmlApplicationEngine, QQmlNetworkAccessManagerFactory
 
 from . import config
 from .theme import THEME
@@ -12,6 +13,19 @@ from .theme import THEME
 def _qt_message_handler(mode, ctx, msg):
     loc = f" ({ctx.file}:{ctx.line})" if ctx.file else ""
     print(f"[qml] {msg}{loc}", file=sys.stderr, flush=True)
+
+
+class _CachingNAMFactory(QQmlNetworkAccessManagerFactory):
+    """Gives QML Images a persistent on-disk HTTP cache so album art doesn't
+    re-download every launch."""
+    def create(self, parent):
+        nam = QNetworkAccessManager(parent)
+        cache = QNetworkDiskCache(nam)
+        config.IMG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache.setCacheDirectory(str(config.IMG_CACHE_DIR))
+        cache.setMaximumCacheSize(256 * 1024 * 1024)
+        nam.setCache(cache)
+        return nam
 
 
 def main():
@@ -47,6 +61,8 @@ def main():
     backend = Backend()
 
     engine = QQmlApplicationEngine()
+    engine._nam_factory = _CachingNAMFactory()  # keep a ref so it isn't GC'd
+    engine.setNetworkAccessManagerFactory(engine._nam_factory)
     ctx = engine.rootContext()
     ctx.setContextProperty("backend", backend)
     ctx.setContextProperty("Theme", THEME)

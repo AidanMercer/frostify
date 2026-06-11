@@ -7,6 +7,10 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 CACHE_FILE = CONFIG_DIR / ".cache"
 DEFAULT_REDIRECT = "http://127.0.0.1:8888/callback"
 
+_CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "frostify"
+DATA_CACHE_DIR = _CACHE_HOME / "data"     # playlists.json, tracks/<id>.json
+IMG_CACHE_DIR = _CACHE_HOME / "images"    # album art (HTTP disk cache)
+
 
 class ConfigError(Exception):
     pass

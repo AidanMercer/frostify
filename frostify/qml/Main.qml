@@ -71,7 +71,8 @@ ApplicationWindow {
         }
         function onPlaylistsLoaded(list) { win.playlists = list }
         function onTracksLoaded(list, title) {
-            win.tracks = list; win.openedName = title; win.mode = "playlist"
+            if (title !== win.openedName) return   // stale result, user already moved on
+            win.tracks = list; win.mode = "playlist"
         }
         function onSearchLoaded(list) {
             win.searchResults = list; win.openedName = "search: " + searchField.text
