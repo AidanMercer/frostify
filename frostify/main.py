@@ -55,7 +55,10 @@ def main():
     app = QGuiApplication(sys.argv)
     app.setApplicationName("frostify")
     app.setDesktopFileName("frostify")  # becomes the Wayland app_id Hyprland sees
-    app.setFont(QFont(THEME["font"]))   # monospace everywhere, yazi-style
+    # monospace everywhere (yazi-style), with emoji fallback for playlist names
+    appfont = QFont()
+    appfont.setFamilies([THEME["font"], "Noto Color Emoji"])
+    app.setFont(appfont)
 
     from .backend import Backend
     backend = Backend()
