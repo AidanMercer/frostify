@@ -1,3 +1,4 @@
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from PySide6.QtCore import QObject, QTimer, Signal, Slot
@@ -38,6 +39,7 @@ class Backend(QObject):
         try:
             fn(*args)
         except Exception as e:  # surface anything to the UI instead of dying silently
+            traceback.print_exc()
             self.error.emit(str(e))
 
     # ---- auth ----
@@ -71,14 +73,14 @@ class Backend(QObject):
         res = self._sp.current_user_playlists(limit=50)
         while res:
             for p in res["items"]:
-                if not p:
+                if not p or not p.get("id"):
                     continue
                 out.append({
                     "id": p["id"],
-                    "uri": p["uri"],
-                    "name": p["name"],
+                    "uri": p.get("uri", ""),
+                    "name": p.get("name", "Untitled"),
                     "image": _img(p.get("images")),
-                    "count": p["tracks"]["total"],
+                    "count": (p.get("tracks") or {}).get("total", 0),
                     "owner": (p.get("owner") or {}).get("display_name", ""),
                 })
             res = self._sp.next(res) if res.get("next") else None
@@ -94,7 +96,9 @@ class Backend(QObject):
         while res:
             raw += res["items"]
             res = self._sp.next(res) if res.get("next") else None
-        tracks = [r["track"] for r in raw if r.get("track") and r["track"].get("id")]
+        # some API/spotipy versions return the track under "item" instead of "track"
+        tracks = [(r.get("track") or r.get("item")) for r in raw]
+        tracks = [t for t in tracks if t and t.get("id")]
         liked = self._saved_contains([t["id"] for t in tracks])
         out = [self._track_dict(t, lk, context_uri) for t, lk in zip(tracks, liked)]
         self.tracksLoaded.emit(out, name)

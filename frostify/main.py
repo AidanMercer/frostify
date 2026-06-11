@@ -1,12 +1,17 @@
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QUrl, qInstallMessageHandler
 from PySide6.QtGui import QGuiApplication, QSurfaceFormat
 from PySide6.QtQml import QQmlApplicationEngine
 
 from . import config
 from .theme import THEME
+
+
+def _qt_message_handler(mode, ctx, msg):
+    loc = f" ({ctx.file}:{ctx.line})" if ctx.file else ""
+    print(f"[qml] {msg}{loc}", file=sys.stderr, flush=True)
 
 
 def main():
@@ -30,6 +35,8 @@ def main():
     fmt = QSurfaceFormat()
     fmt.setAlphaBufferSize(8)
     QSurfaceFormat.setDefaultFormat(fmt)
+
+    qInstallMessageHandler(_qt_message_handler)
 
     app = QGuiApplication(sys.argv)
     app.setApplicationName("frostify")
