@@ -141,8 +141,14 @@ class Backend(QObject):
         if not query.strip():
             self.searchLoaded.emit([])
             return
-        res = self._sp.search(q=query, type="track", limit=30)
-        tracks = [t for t in res["tracks"]["items"] if t.get("id")]
+        # Spotify now caps search limit at 10, so page through it for more results
+        tracks = []
+        for offset in (0, 10, 20, 30):
+            res = self._sp.search(q=query, type="track", limit=10, offset=offset)
+            items = res["tracks"]["items"]
+            tracks += [t for t in items if t.get("id")]
+            if len(items) < 10:
+                break
         liked = dict(zip([t["id"] for t in tracks], self._saved_contains([t["id"] for t in tracks])))
         out = [self._track_dict(t, liked.get(t["id"], False), "") for t in tracks]
         self.searchLoaded.emit(out)
