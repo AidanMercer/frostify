@@ -1,6 +1,6 @@
 # dark frosted palette (tokyo-night-ish), yazi vibe. #AARRGGBB strings.
 THEME = {
-    "bg":          "#e61f2335",   # window base, ~90% dark navy (blur shows through)
+    "bg":          "#661f2335",   # window base, ~40% dark navy (blur shows through)
     "glassSoft":   "#14ffffff",   # hover
     "sel":         "#ff7aa2f7",   # selection pill, active pane (periwinkle)
     "selText":     "#ff1a1b26",   # text on active pill (dark)
