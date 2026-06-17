@@ -70,6 +70,7 @@ class Backend(QObject):
         self._user_id = None
         self._liked_total = None
         self._tick = 0
+        self._track_index = {}         # uri -> track dict, for tracks we might record as recent
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
@@ -406,6 +407,13 @@ class Backend(QObject):
             pass
         return []
 
+    def _index_tracks(self, tracks):
+        # remember search results by uri so we can record a track as "recent" only
+        # if the user actually plays it (not just because it showed up in results)
+        for t in tracks:
+            if t.get("uri"):
+                self._track_index[t["uri"]] = t
+
     def _record_recent(self, tracks):
         tracks = [t for t in tracks if t.get("id")]
         if not tracks:
@@ -528,7 +536,9 @@ class Backend(QObject):
             if fresh and not force:
                 return
         if playlist_id == RECENT_ID:
-            self.tracksLoaded.emit(self._load_recent(), name)   # purely local, no fetch
+            recent = self._load_recent()
+            self.tracksLoaded.emit(recent, name)   # purely local, no fetch
+            self._index_tracks(recent)             # replaying one re-bumps it to the top
             return
         if playlist_id == LIKED_ID:
             # collection context so a played track keeps the rest of liked as the queue
@@ -585,7 +595,7 @@ class Backend(QObject):
         cached, fresh = self._cache_get(key, TTL_SEARCH)
         if cached is not None and fresh and not force:
             self.searchLoaded.emit(cached)
-            self._record_recent(cached)
+            self._index_tracks(cached)
             return
         tracks = []
         for offset in (0, 10, 20, 30):
@@ -599,7 +609,7 @@ class Backend(QObject):
         out   = [self._track_dict(t, liked.get(t["id"], False), "") for t in tracks]
         self.searchLoaded.emit(out)
         self._cache_write(key, out)
-        self._record_recent(out)
+        self._index_tracks(out)
 
     def _saved_contains(self, ids):
         # this spotipy hits the unified me/library/contains endpoint, which rejects
@@ -654,6 +664,10 @@ class Backend(QObject):
             self._sp.start_playback(device_id=dev, context_uri=context_uri, offset={"uri": uri})
         else:
             self._sp.start_playback(device_id=dev, uris=[uri])
+            # a one-off play (no playlist context) means it came from search — record it
+            t = self._track_index.get(uri)
+            if t:
+                self._record_recent([t])
         if context_uri.startswith("spotify:playlist:"):
             if self._record_played(context_uri.rsplit(":", 1)[-1]):
                 self._playlists_task()  # already on the worker thread; re-emit so the sidebar reorders live
