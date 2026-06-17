@@ -1,6 +1,8 @@
 import hashlib
 import json
+import os
 import subprocess
+import sys
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -10,11 +12,15 @@ from PySide6.QtDBus import QDBusConnection, QDBusInterface
 from spotipy.exceptions import SpotifyException
 
 from .auth import make_auth, make_client
-from .config import DATA_CACHE_DIR
+from .config import DATA_CACHE_DIR, LOG_FILE
 
 TTL_PLAYLISTS = 1800
 TTL_TRACKS = 900
 TTL_SEARCH = 3600
+
+LIKED_ID = "liked"     # sentinel id for the Liked Songs pseudo-playlist
+RECENT_ID = "recent"   # sentinel id for the Recent Searches pseudo-playlist
+RECENT_MAX = 100       # how many recently-searched tracks to keep
 
 _MPRIS_PATH = "/org/mpris/MediaPlayer2"
 _PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
@@ -62,6 +68,7 @@ class Backend(QObject):
         self._np_duration_ms = 0
         self._spotifyd_device_id = None
         self._user_id = None
+        self._liked_total = None
         self._tick = 0
 
         self._timer = QTimer(self)
@@ -225,9 +232,12 @@ class Backend(QObject):
         try:
             fn(*args)
         except SpotifyException as e:
+            print(f"[error] Spotify HTTP {e.http_status} (code {e.code}): {e.msg}",
+                  file=sys.stderr, flush=True)
             traceback.print_exc()
             self.error.emit(str(e))
         except Exception as e:
+            print(f"[error] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
             traceback.print_exc()
             self.error.emit(str(e))
 
@@ -278,6 +288,31 @@ class Backend(QObject):
         self._timer.start()
         self._sync()   # show whatever spotifyd is already playing (if anything)
 
+    @Slot()
+    def openLogs(self):
+        # live-tail the log in whatever terminal is around. detached so closing the
+        # terminal (or frostify) doesn't take the other down.
+        tail = ["sh", "-c", 'exec tail -n 500 -f "$1"', "_", str(LOG_FILE)]
+        term = os.environ.get("TERMINAL")
+        attempts = []
+        if term:
+            attempts.append([term, "-e", *tail])
+        attempts += [
+            ["kitty", *tail],
+            ["foot", *tail],
+            ["alacritty", "-e", *tail],
+            ["wezterm", "start", "--", *tail],
+            ["xterm", "-e", *tail],
+        ]
+        for cmd in attempts:
+            try:
+                subprocess.Popen(cmd, start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return
+            except (FileNotFoundError, OSError):
+                continue
+        self.error.emit("Couldn't find a terminal to show logs in.")
+
     @Slot(bool)
     def setActive(self, active):
         if active:
@@ -318,9 +353,69 @@ class Backend(QObject):
                     "owner": (p.get("owner") or {}).get("display_name", ""),
                 })
             res = self._sp.next(res) if res.get("next") else None
+        try:   # refresh the liked count for the sidebar (cheap, total only)
+            self._liked_total = self._sp.current_user_saved_tracks(limit=1).get("total", 0)
+        except Exception:
+            pass
+        # cache only the real playlists; Liked/Recent are injected at display time
+        # by _apply_pins so they always show regardless of cache freshness.
         if out != cached:
             self.playlistsLoaded.emit(self._apply_pins(out))
-        self._cache_write("playlists.json", out)  # cache the raw (unpinned) order
+        self._cache_write("playlists.json", out)
+
+    def _uid(self):
+        if not self._user_id:
+            self._user_id = self._sp.current_user()["id"]
+        return self._user_id
+
+    def _liked_entry(self):
+        # Liked Songs isn't a real playlist. Kept cheap (no network) since this runs
+        # on every sidebar emit; the collection context for playback is resolved when
+        # the list is opened, in _tracks_task. _liked_total is refreshed in the bg.
+        return {
+            "id":    LIKED_ID,
+            "uri":   "",
+            "name":  "Liked Songs",
+            "image": "",
+            "count": self._liked_total or 0,
+            "owner": "you",
+            "pinned": False,
+        }
+
+    def _recent_entry(self):
+        return {
+            "id":    RECENT_ID,
+            "uri":   "",                 # no context — recent tracks play one-off
+            "name":  "Recent Searches",
+            "image": "",
+            "count": len(self._load_recent()),
+            "owner": "you",
+            "pinned": False,
+        }
+
+    # ---- recent searches (local history of searched tracks, newest first) ----
+
+    def _load_recent(self):
+        try:
+            p = DATA_CACHE_DIR / "recent.json"
+            if p.exists():
+                v = json.loads(p.read_text())
+                if isinstance(v, list):
+                    return v
+        except Exception:
+            pass
+        return []
+
+    def _record_recent(self, tracks):
+        tracks = [t for t in tracks if t.get("id")]
+        if not tracks:
+            return
+        fresh = {t["id"] for t in tracks}
+        merged = tracks + [t for t in self._load_recent() if t.get("id") not in fresh]
+        try:
+            (DATA_CACHE_DIR / "recent.json").write_text(json.dumps(merged[:RECENT_MAX]))
+        except Exception:
+            pass
 
     # ---- pinning (local only — Spotify has no pin API) ----
 
@@ -336,12 +431,55 @@ class Backend(QObject):
         return []
 
     def _apply_pins(self, playlists):
-        # pinned playlists float to the top in pin order; the rest keep their order
+        # order: Recent Searches, Liked Songs, then pinned (pin order), then the rest by
+        # most recently played, then whatever order Spotify gave us for the never-played.
+        # The two special rows are injected here so they show regardless of cache state;
+        # we strip any that an older cache baked into the list so they don't double up.
+        real = [p for p in playlists if p["id"] not in (RECENT_ID, LIKED_ID)]
         pinned = self._load_pinned()
         rank = {pid: i for i, pid in enumerate(pinned)}
-        decorated = [{**p, "pinned": p["id"] in rank} for p in playlists]
-        decorated.sort(key=lambda p: rank.get(p["id"], len(pinned)))
-        return decorated
+        played = self._load_played()
+        special = {RECENT_ID: 0, LIKED_ID: 1}
+        decorated = [self._recent_entry(), self._liked_entry()] \
+            + [{**p, "pinned": p["id"] in rank} for p in real]
+
+        def key(item):
+            i, p = item
+            pid = p["id"]
+            if pid in special:
+                return (0, special[pid], 0.0, i)
+            if pid in rank:
+                return (1, rank[pid], 0.0, i)
+            return (2, 0, -played.get(pid, 0), i)  # recent first; 0 (never) keeps Spotify order
+
+        return [p for _, p in sorted(enumerate(decorated), key=key)]
+
+    # ---- last-played tracking (local — drives the recency sort above) ----
+
+    def _load_played(self):
+        try:
+            p = DATA_CACHE_DIR / "played.json"
+            if p.exists():
+                v = json.loads(p.read_text())
+                if isinstance(v, dict):
+                    return v
+        except Exception:
+            pass
+        return {}
+
+    def _record_played(self, playlist_id):
+        # returns True if this changes which playlist is most-recent (i.e. the
+        # sidebar order would actually shift), so the caller can skip a needless re-emit.
+        if not playlist_id:
+            return False
+        played = self._load_played()
+        was_top = bool(played) and max(played, key=played.get) == playlist_id
+        played[playlist_id] = time.time()
+        try:
+            (DATA_CACHE_DIR / "played.json").write_text(json.dumps(played))
+        except Exception:
+            pass
+        return not was_top
 
     @Slot(str)
     def togglePin(self, playlist_id):
@@ -389,6 +527,25 @@ class Backend(QObject):
             self.tracksLoaded.emit(cached, name)
             if fresh and not force:
                 return
+        if playlist_id == RECENT_ID:
+            self.tracksLoaded.emit(self._load_recent(), name)   # purely local, no fetch
+            return
+        if playlist_id == LIKED_ID:
+            # collection context so a played track keeps the rest of liked as the queue
+            context_uri = f"spotify:user:{self._uid()}:collection"
+            raw = []
+            res = self._sp.current_user_saved_tracks(limit=50)
+            while res:
+                raw += res["items"]
+                res = self._sp.next(res) if res.get("next") else None
+            tracks = [r.get("track") for r in raw]
+            tracks = [t for t in tracks if t and t.get("id")]
+            out = [self._track_dict(t, True, context_uri) for t in tracks]  # all liked by definition
+            self._liked_total = len(out)
+            if out != cached:
+                self.tracksLoaded.emit(out, name)
+            self._cache_write(key, out)
+            return
         raw = []
         try:
             res = self._sp.playlist_items(playlist_id, limit=100, additional_types=["track"])
@@ -428,6 +585,7 @@ class Backend(QObject):
         cached, fresh = self._cache_get(key, TTL_SEARCH)
         if cached is not None and fresh and not force:
             self.searchLoaded.emit(cached)
+            self._record_recent(cached)
             return
         tracks = []
         for offset in (0, 10, 20, 30):
@@ -441,6 +599,7 @@ class Backend(QObject):
         out   = [self._track_dict(t, liked.get(t["id"], False), "") for t in tracks]
         self.searchLoaded.emit(out)
         self._cache_write(key, out)
+        self._record_recent(out)
 
     def _saved_contains(self, ids):
         out = []
@@ -493,6 +652,9 @@ class Backend(QObject):
             self._sp.start_playback(device_id=dev, context_uri=context_uri, offset={"uri": uri})
         else:
             self._sp.start_playback(device_id=dev, uris=[uri])
+        if context_uri.startswith("spotify:playlist:"):
+            if self._record_played(context_uri.rsplit(":", 1)[-1]):
+                self._playlists_task()  # already on the worker thread; re-emit so the sidebar reorders live
 
     @Slot()
     def togglePlay(self):
@@ -528,6 +690,7 @@ class Backend(QObject):
                 self._sp.current_user_saved_tracks_add([track_id])
             else:
                 self._sp.current_user_saved_tracks_delete([track_id])
+            self._cache_delete(f"tracks/{LIKED_ID}.json")  # the liked list changed
             if track_id == self._np_id:
                 self._np_liked = like
                 snap = self._local_np
@@ -541,7 +704,12 @@ class Backend(QObject):
     @Slot(str, str)
     def addToPlaylist(self, track_uri, playlist_id):
         def task():
-            self._sp.playlist_add_items(playlist_id, [track_uri])
+            if playlist_id == LIKED_ID:
+                # "add to Liked Songs" == save the track
+                self._sp.current_user_saved_tracks_add([track_uri.rsplit(":", 1)[-1]])
+                self.toast.emit("Added to Liked Songs")
+            else:
+                self._sp.playlist_add_items(playlist_id, [track_uri])
+                self.toast.emit("Added to playlist")
             self._cache_delete(f"tracks/{playlist_id}.json")
-            self.toast.emit("Added to playlist")
         self._submit(task)

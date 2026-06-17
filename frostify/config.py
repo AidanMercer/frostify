@@ -10,6 +10,7 @@ DEFAULT_REDIRECT = "http://127.0.0.1:8888/callback"
 _CACHE_HOME = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "frostify"
 DATA_CACHE_DIR = _CACHE_HOME / "data"     # playlists.json, tracks/<id>.json
 IMG_CACHE_DIR = _CACHE_HOME / "images"    # album art (HTTP disk cache)
+LOG_FILE = _CACHE_HOME / "frostify.log"   # tee'd stdout/stderr (see main.py)
 
 
 class ConfigError(Exception):

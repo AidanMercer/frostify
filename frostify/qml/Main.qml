@@ -163,6 +163,25 @@ ApplicationWindow {
                     spacing: 10
 
                     Rectangle {
+                        width: 52; height: 28
+                        anchors.verticalCenter: parent.verticalCenter
+                        radius: Theme.radiusSm
+                        color: logHover.hovered ? Theme.glassSoft : "transparent"
+                        border.color: Theme.border; border.width: 1
+                        Behavior on color { ColorAnimation { duration: 120 } }
+                        HoverHandler { id: logHover }
+                        Text {
+                            anchors.centerIn: parent
+                            text: "logs"; color: Theme.subtext; font.pixelSize: 12
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: backend.openLogs()
+                        }
+                    }
+
+                    Rectangle {
                         width: 220; height: 28
                         anchors.verticalCenter: parent.verticalCenter
                         radius: Theme.radiusSm
