@@ -602,9 +602,11 @@ class Backend(QObject):
         self._record_recent(out)
 
     def _saved_contains(self, ids):
+        # this spotipy hits the unified me/library/contains endpoint, which rejects
+        # 50 uris at once ("Too many uris requested") — chunk by 20.
         out = []
-        for i in range(0, len(ids), 50):
-            out += self._sp.current_user_saved_tracks_contains(ids[i:i + 50])
+        for i in range(0, len(ids), 20):
+            out += self._sp.current_user_saved_tracks_contains(ids[i:i + 20])
         return out
 
     def _track_dict(self, t, liked, context_uri):
