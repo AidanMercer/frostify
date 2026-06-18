@@ -19,9 +19,10 @@ TTL_PLAYLISTS = 1800
 TTL_TRACKS = 900
 TTL_SEARCH = 3600
 
-LIKED_ID = "liked"     # sentinel id for the Liked Songs pseudo-playlist
-RECENT_ID = "recent"   # sentinel id for the Recent Searches pseudo-playlist
-RECENT_MAX = 100       # how many recently-searched tracks to keep
+LIKED_ID = "liked"       # sentinel id for the Liked Songs pseudo-playlist
+RECENT_ID = "recent"     # sentinel id for the Recent Searches pseudo-playlist
+DESKTOP_ID = "desktop"   # sentinel id for the local Desktop stash pseudo-playlist
+RECENT_MAX = 100         # how many recently-searched tracks to keep
 
 _MPRIS_PATH = "/org/mpris/MediaPlayer2"
 _PLAYER_IFACE = "org.mpris.MediaPlayer2.Player"
@@ -124,6 +125,7 @@ class Backend(QObject):
         self._recent = None            # in-memory mirrors of the small sidebar json files,
         self._pinned = None            # loaded once and kept in sync on write so the sidebar
         self._played = None            # doesn't re-read/parse disk on every emit
+        self._desktop = None           # local Desktop stash (full track dicts, newest first)
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
@@ -504,6 +506,47 @@ class Backend(QObject):
             "pinned": False,
         }
 
+    def _desktop_entry(self):
+        return {
+            "id":    DESKTOP_ID,
+            "uri":   "",                 # local stash — tracks play one-off, no context
+            "name":  "Desktop",
+            "image": "",
+            "count": len(self._load_desktop()),
+            "owner": "you",
+            "pinned": False,
+        }
+
+    # ---- desktop stash (local, hand-curated with the 'd' key; newest first) ----
+
+    def _load_desktop(self):
+        if self._desktop is None:
+            self._desktop = self._read_json("desktop.json", list, [])
+        return self._desktop
+
+    @Slot("QVariant")
+    def addToDesktop(self, track):
+        self._submit(self._desktop_toggle_task, dict(track) if track else {})
+
+    def _desktop_toggle_task(self, track):
+        tid = track.get("id")
+        if not tid:
+            return
+        items = self._load_desktop()
+        if any(t.get("id") == tid for t in items):
+            items = [t for t in items if t.get("id") != tid]
+            msg = "Removed from Desktop"
+        else:
+            # store a one-off copy (no playlist context) so it plays standalone
+            items = [{**track, "contextUri": ""}] + items
+            msg = "Added to Desktop"
+        self._desktop = items
+        self._write_json("desktop.json", items)
+        self.toast.emit(msg)
+        self.tracksLoaded.emit(items, "Desktop")  # refresh the view only if Desktop is open
+        self._index_tracks(items)
+        self._playlists_task()                    # refresh the sidebar count/order
+
     # ---- recent searches (local history of searched tracks, newest first) ----
 
     def _load_recent(self):
@@ -539,12 +582,12 @@ class Backend(QObject):
         # most recently played, then whatever order Spotify gave us for the never-played.
         # The two special rows are injected here so they show regardless of cache state;
         # we strip any that an older cache baked into the list so they don't double up.
-        real = [p for p in playlists if p["id"] not in (RECENT_ID, LIKED_ID)]
+        real = [p for p in playlists if p["id"] not in (RECENT_ID, DESKTOP_ID, LIKED_ID)]
         pinned = self._load_pinned()
         rank = {pid: i for i, pid in enumerate(pinned)}
         played = self._load_played()
-        special = {RECENT_ID: 0, LIKED_ID: 1}
-        decorated = [self._recent_entry(), self._liked_entry()] \
+        special = {RECENT_ID: 0, DESKTOP_ID: 1, LIKED_ID: 2}
+        decorated = [self._recent_entry(), self._desktop_entry(), self._liked_entry()] \
             + [{**p, "pinned": p["id"] in rank} for p in real]
 
         def key(item):
@@ -623,6 +666,11 @@ class Backend(QObject):
             recent = self._load_recent()
             self.tracksLoaded.emit(recent, name)   # purely local, no fetch
             self._index_tracks(recent)             # replaying one re-bumps it to the top
+            return
+        if playlist_id == DESKTOP_ID:
+            items = self._load_desktop()
+            self.tracksLoaded.emit(items, name)    # purely local, no fetch
+            self._index_tracks(items)
             return
         if playlist_id == LIKED_ID:
             # collection context so a played track keeps the rest of liked as the queue

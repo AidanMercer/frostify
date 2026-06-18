@@ -43,8 +43,9 @@ Item {
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
                     text: modelData.pinned ? "📌"
-                        : modelData.id === "liked"  ? "♥"
-                        : modelData.id === "recent" ? "🕘"
+                        : modelData.id === "liked"   ? "♥"
+                        : modelData.id === "recent"  ? "🕘"
+                        : modelData.id === "desktop" ? "🖥"
                         : "♫"
                     color: index === root.cursor && root.active ? Theme.selText : Theme.teal
                     font.pixelSize: 13

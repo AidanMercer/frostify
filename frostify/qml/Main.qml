@@ -125,6 +125,9 @@ ApplicationWindow {
                     var t = win.previewItem()
                     backend.toggleLike(t.id, !t.liked); e.accepted = true
                 }
+                else if (e.text === "d" && win.previewItem() && win.activePane === "tracks") {
+                    backend.addToDesktop(win.previewItem()); e.accepted = true
+                }
                 else if (e.text === "r") { win.refreshCurrent(); e.accepted = true }
                 else if (e.text === "p" && win.activePane === "playlists" && win.playlists[win.plCursor]) {
                     backend.togglePin(win.playlists[win.plCursor].id); e.accepted = true

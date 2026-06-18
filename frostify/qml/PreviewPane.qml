@@ -72,6 +72,11 @@ Item {
                 color: (root.item && root.item.liked) ? Theme.accent : Theme.subtext
                 font.pixelSize: 12
             }
+            Text {
+                text: "🖥  press d for Desktop"
+                color: Theme.subtext
+                font.pixelSize: 12
+            }
         }
     }
 

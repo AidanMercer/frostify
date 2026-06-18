@@ -62,7 +62,7 @@ Item {
             Menu {
                 id: addMenu
                 Repeater {
-                    model: root.playlists.filter(function(p) { return p.id !== "recent" })
+                    model: root.playlists.filter(function(p) { return p.id !== "recent" && p.id !== "desktop" })
                     MenuItem {
                         required property var modelData
                         text: "+ " + modelData.name
