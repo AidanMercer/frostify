@@ -90,6 +90,7 @@ class Backend(QObject):
         self._liked_total = None
         self._tick = 0
         self._track_index = {}         # uri -> track dict, for tracks we might record as recent
+        self._search_seq = 0           # bumped per search; stale queued searches drop themselves
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
@@ -222,6 +223,10 @@ class Backend(QObject):
     def _check_liked_task(self, tid):
         try:
             liked = self._sp.current_user_saved_tracks_contains([tid])[0] if tid else False
+        except SpotifyException as e:
+            if e.http_status == 429:
+                raise          # let _guard trip the cooldown instead of hiding it
+            liked = False
         except Exception:
             liked = False
         self._np_liked = liked
@@ -630,13 +635,19 @@ class Backend(QObject):
 
     @Slot(str)
     def search(self, query):
-        self._submit(self._search_task, query)
+        self._search_seq += 1
+        self._submit(self._search_task, query, False, self._search_seq)
 
     @Slot(str)
     def refreshSearch(self, query):
-        self._submit(self._search_task, query, True)
+        self._search_seq += 1
+        self._submit(self._search_task, query, True, self._search_seq)
 
-    def _search_task(self, query, force=False):
+    def _search_task(self, query, force, seq):
+        # a newer keystroke already superseded this one — don't bother the API
+        # for results that would be thrown away (and would flicker the UI).
+        if seq != self._search_seq:
+            return
         q = query.strip()
         if not q:
             self.searchLoaded.emit([])
