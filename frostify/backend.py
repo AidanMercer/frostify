@@ -54,6 +54,32 @@ def _json_val(node):
     return node
 
 
+class RateLimited(Exception):
+    """Raised in place of an API call while a 429 cooldown is active, so a task
+    can still serve cache and then unwind quietly instead of hitting Spotify."""
+
+
+class _Guarded:
+    """Wraps the spotipy client: every API call first checks the backend's
+    rate-limit cooldown and raises RateLimited rather than touching the network.
+    Lets tasks emit cached data before the (suppressed) live fetch."""
+
+    def __init__(self, sp, backend):
+        self._sp = sp
+        self._backend = backend
+
+    def __getattr__(self, name):
+        attr = getattr(self._sp, name)
+        if not callable(attr):
+            return attr
+
+        def wrapped(*args, **kwargs):
+            if self._backend._rl_remaining() > 0:
+                raise RateLimited()
+            return attr(*args, **kwargs)
+        return wrapped
+
+
 class Backend(QObject):
     loggedInChanged = Signal(bool)
     playlistsLoaded = Signal(list)
@@ -68,16 +94,17 @@ class Backend(QObject):
         # single worker so spotipy's session is never touched concurrently
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._auth = make_auth()
-        self._sp = make_client(self._auth)
 
         # rate-limit circuit breaker: once Spotify 429s us, suppress all further
         # requests until this monotonic deadline instead of hammering (which only
         # makes Spotify extend the ban). Protected by a lock because the deadline
         # is read on the worker thread and written there too, but the toast
-        # throttle is touched from the same thread only.
+        # throttle is touched from the same thread only. _Guarded raises
+        # RateLimited at each call site so tasks can still serve cache first.
         self._rl_until = 0.0
         self._rl_lock = threading.Lock()
         self._rl_toast_at = 0.0
+        self._sp = _Guarded(make_client(self._auth), self)
 
         self._np_id = None
         self._np_liked = False
@@ -254,17 +281,17 @@ class Backend(QObject):
         self._pool.submit(self._guard, fn, *args)
 
     def _guard(self, fn, *args):
-        remaining = self._rl_remaining()
-        if remaining > 0:
-            # still cooling down from a 429 — don't pile on; piling on is what
-            # pushes Spotify's Retry-After from seconds into hours.
+        try:
+            fn(*args)
+        except RateLimited:
+            # cooldown is active; the task already served whatever it had cached,
+            # then its live fetch was suppressed. Nudge the user, throttled, so we
+            # don't toast on every queued action during a long ban.
             now = time.monotonic()
             if now - self._rl_toast_at > 5:
                 self._rl_toast_at = now
-                self.toast.emit(f"Spotify rate limit — try again in {_fmt_dur(remaining)}")
-            return
-        try:
-            fn(*args)
+                self.toast.emit(
+                    f"Spotify rate limit — try again in {_fmt_dur(self._rl_remaining())}")
         except SpotifyException as e:
             if e.http_status == 429:
                 self._enter_cooldown(e)
@@ -724,10 +751,20 @@ class Backend(QObject):
         if not dev:
             self.error.emit("spotifyd device not found — is spotifyd running?")
             return
-        if context_uri:
-            self._sp.start_playback(device_id=dev, context_uri=context_uri, offset={"uri": uri})
-        else:
-            self._sp.start_playback(device_id=dev, uris=[uri])
+        try:
+            self._start_playback(dev, uri, context_uri)
+        except SpotifyException as e:
+            # a cached device id that 404s means spotifyd restarted with a new id —
+            # drop it, re-resolve once, and retry so playback doesn't silently die.
+            if e.http_status != 404 or not self._spotifyd_device_id:
+                raise
+            self._spotifyd_device_id = None
+            dev = self._spotifyd_device()
+            if not dev:
+                self.error.emit("spotifyd device not found — is spotifyd running?")
+                return
+            self._start_playback(dev, uri, context_uri)
+        if not context_uri:
             # a one-off play (no playlist context) means it came from search — record it
             t = self._track_index.get(uri)
             if t:
@@ -735,6 +772,12 @@ class Backend(QObject):
         if context_uri.startswith("spotify:playlist:"):
             if self._record_played(context_uri.rsplit(":", 1)[-1]):
                 self._playlists_task()  # already on the worker thread; re-emit so the sidebar reorders live
+
+    def _start_playback(self, dev, uri, context_uri):
+        if context_uri:
+            self._sp.start_playback(device_id=dev, context_uri=context_uri, offset={"uri": uri})
+        else:
+            self._sp.start_playback(device_id=dev, uris=[uri])
 
     @Slot()
     def togglePlay(self):
