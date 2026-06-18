@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -33,6 +34,15 @@ def _img(images, smallest=False):
     return images[-1]["url"] if smallest else images[0]["url"]
 
 
+def _fmt_dur(seconds):
+    s = int(seconds)
+    if s >= 3600:
+        return f"{s // 3600}h {s % 3600 // 60}m"
+    if s >= 60:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s}s"
+
+
 def _json_val(node):
     """Unwrap busctl --json `{"type","data"}` nodes into plain values."""
     if isinstance(node, dict):
@@ -59,6 +69,15 @@ class Backend(QObject):
         self._pool = ThreadPoolExecutor(max_workers=1)
         self._auth = make_auth()
         self._sp = make_client(self._auth)
+
+        # rate-limit circuit breaker: once Spotify 429s us, suppress all further
+        # requests until this monotonic deadline instead of hammering (which only
+        # makes Spotify extend the ban). Protected by a lock because the deadline
+        # is read on the worker thread and written there too, but the toast
+        # throttle is touched from the same thread only.
+        self._rl_until = 0.0
+        self._rl_lock = threading.Lock()
+        self._rl_toast_at = 0.0
 
         self._np_id = None
         self._np_liked = False
@@ -230,9 +249,21 @@ class Backend(QObject):
         self._pool.submit(self._guard, fn, *args)
 
     def _guard(self, fn, *args):
+        remaining = self._rl_remaining()
+        if remaining > 0:
+            # still cooling down from a 429 — don't pile on; piling on is what
+            # pushes Spotify's Retry-After from seconds into hours.
+            now = time.monotonic()
+            if now - self._rl_toast_at > 5:
+                self._rl_toast_at = now
+                self.toast.emit(f"Spotify rate limit — try again in {_fmt_dur(remaining)}")
+            return
         try:
             fn(*args)
         except SpotifyException as e:
+            if e.http_status == 429:
+                self._enter_cooldown(e)
+                return
             print(f"[error] Spotify HTTP {e.http_status} (code {e.code}): {e.msg}",
                   file=sys.stderr, flush=True)
             traceback.print_exc()
@@ -241,6 +272,25 @@ class Backend(QObject):
             print(f"[error] {type(e).__name__}: {e}", file=sys.stderr, flush=True)
             traceback.print_exc()
             self.error.emit(str(e))
+
+    def _rl_remaining(self):
+        with self._rl_lock:
+            return max(0.0, self._rl_until - time.monotonic())
+
+    def _enter_cooldown(self, exc):
+        # honour Spotify's Retry-After exactly — that's the value that lets the
+        # ban actually expire. Fall back to a short backoff when it's missing.
+        try:
+            retry_after = int((exc.headers or {}).get("Retry-After", 0))
+        except (TypeError, ValueError):
+            retry_after = 0
+        cooldown = max(5, retry_after)
+        with self._rl_lock:
+            self._rl_until = time.monotonic() + cooldown
+        self._rl_toast_at = time.monotonic()
+        print(f"[rate-limit] backing off {cooldown}s (Retry-After: {retry_after}s)",
+              file=sys.stderr, flush=True)
+        self.toast.emit(f"Spotify rate limit — pausing for {_fmt_dur(cooldown)}")
 
     # ---- disk cache ----
 
@@ -573,7 +623,7 @@ class Backend(QObject):
         tracks = [(r.get("track") or r.get("item")) for r in raw]
         tracks = [t for t in tracks if t and t.get("id")]
         liked  = self._saved_contains([t["id"] for t in tracks])
-        out    = [self._track_dict(t, lk, context_uri) for t, lk in zip(tracks, liked)]
+        out    = [self._track_dict(t, liked.get(t["id"], False), context_uri) for t in tracks]
         if out != cached:
             self.tracksLoaded.emit(out, name)
         self._cache_write(key, out)
@@ -597,27 +647,30 @@ class Backend(QObject):
             self.searchLoaded.emit(cached)
             self._index_tracks(cached)
             return
-        tracks = []
-        for offset in (0, 10, 20, 30):
-            res   = self._sp.search(q=q, type="track", limit=10, offset=offset)
-            items = res["tracks"]["items"]
-            tracks += [t for t in items if t.get("id")]
-            if len(items) < 10:
-                break
-        ids   = [t["id"] for t in tracks]
-        liked = dict(zip(ids, self._saved_contains(ids)))
+        # one limit=50 call instead of four paginated limit=10 calls — same
+        # results, a quarter of the requests (and 429s). Dedup by id since the
+        # API can still echo a track more than once.
+        res    = self._sp.search(q=q, type="track", limit=50)
+        items  = (res.get("tracks") or {}).get("items") or []
+        tracks = list({t["id"]: t for t in items if t.get("id")}.values())
+        liked  = self._saved_contains([t["id"] for t in tracks])
         out   = [self._track_dict(t, liked.get(t["id"], False), "") for t in tracks]
         self.searchLoaded.emit(out)
         self._cache_write(key, out)
         self._index_tracks(out)
 
     def _saved_contains(self, ids):
-        # this spotipy hits the unified me/library/contains endpoint, which rejects
-        # 50 uris at once ("Too many uris requested") — chunk by 20.
-        out = []
-        for i in range(0, len(ids), 20):
-            out += self._sp.current_user_saved_tracks_contains(ids[i:i + 20])
-        return out
+        # Returns {id: bool}. Dedup first: search pages and playlists routinely
+        # repeat track ids, and every duplicate would otherwise cost another slot
+        # in a 429-prone request. This spotipy hits the unified
+        # me/library/contains endpoint, which rejects 50 uris at once
+        # ("Too many uris requested") — chunk the unique ids by 20.
+        uniq = list(dict.fromkeys(i for i in ids if i))
+        liked = {}
+        for i in range(0, len(uniq), 20):
+            chunk = uniq[i:i + 20]
+            liked.update(zip(chunk, self._sp.current_user_saved_tracks_contains(chunk)))
+        return liked
 
     def _track_dict(self, t, liked, context_uri):
         album = t.get("album") or {}

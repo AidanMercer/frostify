@@ -33,9 +33,14 @@ def make_auth(open_browser=True):
 
 def make_client(auth=None):
     auth = auth or make_auth()
-    # retries=0: never let spotipy sleep on a 429 Retry-After (it can be hours)
-    # and freeze the worker thread — we surface and back off ourselves instead.
-    return spotipy.Spotify(auth_manager=auth, retries=0, requests_timeout=10)
+    # retries=0 *and* status_retries=0: never let spotipy sleep on a 429
+    # Retry-After (it can be hours) or burn through retries hammering Spotify —
+    # both of which freeze the worker thread. We surface 429s immediately and
+    # back off ourselves instead (see Backend._guard). retries alone isn't
+    # enough: spotipy builds its urllib3 Retry with status=status_retries,
+    # which defaults to 3.
+    return spotipy.Spotify(auth_manager=auth, retries=0, status_retries=0,
+                           requests_timeout=10)
 
 
 def has_cached_token(auth):
