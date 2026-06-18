@@ -118,6 +118,12 @@ class Backend(QObject):
         self._tick = 0
         self._track_index = {}         # uri -> track dict, for tracks we might record as recent
         self._search_seq = 0           # bumped per search; stale queued searches drop themselves
+        self._liked_cache = {}         # track id -> bool; populated from every fetch that
+                                       # already knows liked state, so now-playing changes
+                                       # don't re-hit the API for tracks we just saw
+        self._recent = None            # in-memory mirrors of the small sidebar json files,
+        self._pinned = None            # loaded once and kept in sync on write so the sidebar
+        self._played = None            # doesn't re-read/parse disk on every emit
 
         self._timer = QTimer(self)
         self._timer.setInterval(1000)
@@ -248,14 +254,19 @@ class Backend(QObject):
         self.nowPlaying.emit(data)
 
     def _check_liked_task(self, tid):
-        try:
-            liked = self._sp.current_user_saved_tracks_contains([tid])[0] if tid else False
-        except SpotifyException as e:
-            if e.http_status == 429:
-                raise          # let _guard trip the cooldown instead of hiding it
-            liked = False
-        except Exception:
-            liked = False
+        if tid in self._liked_cache:
+            liked = self._liked_cache[tid]          # seen this session — no API call
+        else:
+            try:
+                liked = self._sp.current_user_saved_tracks_contains([tid])[0] if tid else False
+            except SpotifyException as e:
+                if e.http_status == 429:
+                    raise      # let _guard trip the cooldown instead of hiding it
+                liked = False
+            except Exception:
+                liked = False
+            if tid:
+                self._liked_cache[tid] = liked
         self._np_liked = liked
         snap = self._local_np
         if snap and snap.get("id") == tid:
@@ -347,6 +358,23 @@ class Backend(QObject):
     def _cache_delete(self, name):
         try:
             (DATA_CACHE_DIR / name).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _read_json(self, name, typ, default):
+        try:
+            p = DATA_CACHE_DIR / name
+            if p.exists():
+                v = json.loads(p.read_text())
+                if isinstance(v, typ):
+                    return v
+        except Exception:
+            pass
+        return default
+
+    def _write_json(self, name, data):
+        try:
+            (DATA_CACHE_DIR / name).write_text(json.dumps(data))
         except Exception:
             pass
 
@@ -479,15 +507,9 @@ class Backend(QObject):
     # ---- recent searches (local history of searched tracks, newest first) ----
 
     def _load_recent(self):
-        try:
-            p = DATA_CACHE_DIR / "recent.json"
-            if p.exists():
-                v = json.loads(p.read_text())
-                if isinstance(v, list):
-                    return v
-        except Exception:
-            pass
-        return []
+        if self._recent is None:
+            self._recent = self._read_json("recent.json", list, [])
+        return self._recent
 
     def _index_tracks(self, tracks):
         # remember search results by uri so we can record a track as "recent" only
@@ -502,23 +524,15 @@ class Backend(QObject):
             return
         fresh = {t["id"] for t in tracks}
         merged = tracks + [t for t in self._load_recent() if t.get("id") not in fresh]
-        try:
-            (DATA_CACHE_DIR / "recent.json").write_text(json.dumps(merged[:RECENT_MAX]))
-        except Exception:
-            pass
+        self._recent = merged[:RECENT_MAX]
+        self._write_json("recent.json", self._recent)
 
     # ---- pinning (local only — Spotify has no pin API) ----
 
     def _load_pinned(self):
-        try:
-            p = DATA_CACHE_DIR / "pinned.json"
-            if p.exists():
-                v = json.loads(p.read_text())
-                if isinstance(v, list):
-                    return v
-        except Exception:
-            pass
-        return []
+        if self._pinned is None:
+            self._pinned = self._read_json("pinned.json", list, [])
+        return self._pinned
 
     def _apply_pins(self, playlists):
         # order: Recent Searches, Liked Songs, then pinned (pin order), then the rest by
@@ -547,15 +561,9 @@ class Backend(QObject):
     # ---- last-played tracking (local — drives the recency sort above) ----
 
     def _load_played(self):
-        try:
-            p = DATA_CACHE_DIR / "played.json"
-            if p.exists():
-                v = json.loads(p.read_text())
-                if isinstance(v, dict):
-                    return v
-        except Exception:
-            pass
-        return {}
+        if self._played is None:
+            self._played = self._read_json("played.json", dict, {})
+        return self._played
 
     def _record_played(self, playlist_id):
         # returns True if this changes which playlist is most-recent (i.e. the
@@ -565,10 +573,7 @@ class Backend(QObject):
         played = self._load_played()
         was_top = bool(played) and max(played, key=played.get) == playlist_id
         played[playlist_id] = time.time()
-        try:
-            (DATA_CACHE_DIR / "played.json").write_text(json.dumps(played))
-        except Exception:
-            pass
+        self._write_json("played.json", played)
         return not was_top
 
     @Slot(str)
@@ -580,10 +585,7 @@ class Backend(QObject):
         else:
             pinned.insert(0, playlist_id)
             msg = "Pinned"
-        try:
-            (DATA_CACHE_DIR / "pinned.json").write_text(json.dumps(pinned))
-        except Exception:
-            pass
+        self._write_json("pinned.json", pinned)
         self.toast.emit(msg)
         self._submit(self._playlists_task)  # re-emit from cache with new order
 
@@ -633,6 +635,7 @@ class Backend(QObject):
             tracks = [r.get("track") for r in raw]
             tracks = [t for t in tracks if t and t.get("id")]
             out = [self._track_dict(t, True, context_uri) for t in tracks]  # all liked by definition
+            self._liked_cache.update({t["id"]: True for t in tracks})
             self._liked_total = len(out)
             if out != cached:
                 self.tracksLoaded.emit(out, name)
@@ -655,6 +658,7 @@ class Backend(QObject):
         tracks = [(r.get("track") or r.get("item")) for r in raw]
         tracks = [t for t in tracks if t and t.get("id")]
         liked  = self._saved_contains([t["id"] for t in tracks])
+        self._liked_cache.update(liked)
         out    = [self._track_dict(t, liked.get(t["id"], False), context_uri) for t in tracks]
         if out != cached:
             self.tracksLoaded.emit(out, name)
@@ -692,6 +696,7 @@ class Backend(QObject):
         items  = (res.get("tracks") or {}).get("items") or []
         tracks = list({t["id"]: t for t in items if t.get("id")}.values())
         liked  = self._saved_contains([t["id"] for t in tracks])
+        self._liked_cache.update(liked)
         out   = [self._track_dict(t, liked.get(t["id"], False), "") for t in tracks]
         self.searchLoaded.emit(out)
         self._cache_write(key, out)
@@ -813,6 +818,7 @@ class Backend(QObject):
                 self._sp.current_user_saved_tracks_add([track_id])
             else:
                 self._sp.current_user_saved_tracks_delete([track_id])
+            self._liked_cache[track_id] = like
             self._cache_delete(f"tracks/{LIKED_ID}.json")  # the liked list changed
             if track_id == self._np_id:
                 self._np_liked = like
@@ -830,6 +836,7 @@ class Backend(QObject):
             if playlist_id == LIKED_ID:
                 # "add to Liked Songs" == save the track
                 self._sp.current_user_saved_tracks_add([track_uri.rsplit(":", 1)[-1]])
+                self._liked_cache[track_uri.rsplit(":", 1)[-1]] = True
                 self.toast.emit("Added to Liked Songs")
             else:
                 self._sp.playlist_add_items(playlist_id, [track_uri])
