@@ -170,7 +170,7 @@ class Backend(QObject):
             return {"active": False}
         cmd = ["busctl", "--user", "--json=short", "get-property",
                self._service, _MPRIS_PATH, _PLAYER_IFACE,
-               "PlaybackStatus", "Metadata", "Position"]
+               "PlaybackStatus", "Metadata", "Position", "Volume"]
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
         except Exception:
@@ -180,7 +180,7 @@ class Backend(QObject):
             return {"active": False}
 
         vals = {}
-        for name, line in zip(("PlaybackStatus", "Metadata", "Position"),
+        for name, line in zip(("PlaybackStatus", "Metadata", "Position", "Volume"),
                               res.stdout.strip().splitlines()):
             try:
                 vals[name] = _json_val(json.loads(line))
@@ -209,6 +209,10 @@ class Backend(QObject):
             dur_us = int(meta.get("mpris:length", 0) or 0)
         except (ValueError, TypeError):
             dur_us = 0
+        try:
+            volume = max(0, min(100, int(round(float(vals.get("Volume") or 0.0) * 100))))
+        except (ValueError, TypeError):
+            volume = 0
 
         # bare track id from the url ("spotify:track:X") or trackid path ("/spotify/track/X")
         if url.startswith("spotify:track:"):
@@ -238,6 +242,7 @@ class Backend(QObject):
             "image":      image,
             "progressMs": progress_ms,
             "durationMs": duration_ms,
+            "volume":     volume,
             "liked":      False,
         }
 
@@ -858,6 +863,33 @@ class Backend(QObject):
         except Exception:
             pass
         QTimer.singleShot(150, self._sync)
+
+    @Slot(int)
+    def setVolume(self, pct):
+        # Sets spotifyd's own MPRIS volume (its Spotify Connect device level), which
+        # only attenuates spotifyd's audio — not the system mixer. Runs on the worker
+        # so the (fast, local) busctl call is off the GUI thread and the child is reaped.
+        self._submit(self._set_volume_task, max(0, min(100, int(pct))))
+
+    def _set_volume_task(self, pct):
+        svc = self._service          # populated by the regular sync's _rebind
+        if not svc:
+            return
+        try:
+            subprocess.run(
+                ["busctl", "--user", "set-property", svc, _MPRIS_PATH, _PLAYER_IFACE,
+                 "Volume", "d", f"{pct / 100:.4f}"],
+                capture_output=True, timeout=2,
+            )
+        except Exception:
+            return
+        # optimistic echo so the slider settles on the new value without waiting for
+        # the next poll (which is up to _SYNC_EVERY seconds away).
+        snap = self._local_np
+        if snap and snap.get("active"):
+            data = {**snap, "volume": pct}
+            self._local_np = data
+            self.nowPlaying.emit(data)
 
     @Slot(str, bool)
     def toggleLike(self, track_id, like):
