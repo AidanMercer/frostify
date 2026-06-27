@@ -742,10 +742,10 @@ class Backend(QObject):
             self.searchLoaded.emit(cached)
             self._index_tracks(cached)
             return
-        # one limit=50 call instead of four paginated limit=10 calls — same
-        # results, a quarter of the requests (and 429s). Dedup by id since the
-        # API can still echo a track more than once.
-        res    = self._sp.search(q=q, type="track", limit=50)
+        # Spotify capped /search limit at 10 (Feb 2026 changelog; 50 now 400s
+        # "Invalid limit"). Dedup by id since the API can still echo a track
+        # more than once.
+        res    = self._sp.search(q=q, type="track", limit=10)
         items  = (res.get("tracks") or {}).get("items") or []
         tracks = list({t["id"]: t for t in items if t.get("id")}.values())
         liked  = self._saved_contains([t["id"] for t in tracks])
