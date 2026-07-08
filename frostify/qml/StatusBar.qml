@@ -4,14 +4,27 @@ Item {
     id: root
     property var np: ({ "active": false })
     property string position: "0/0"
+    property var chrome: null      // rice theme layer — optional text/glyph overrides
+
+    function cp(name, fallback) {
+        var v = chrome ? chrome[name] : undefined
+        return v === undefined ? fallback : v
+    }
 
     function pct() {
         if (!np.active || !np.durationMs) return 0
         return Math.round(np.progressMs / np.durationMs * 100)
     }
 
+    function fmtTime(ms) {
+        if (!ms || ms < 0) return "0:00"
+        var s = Math.floor(ms / 1000), m = Math.floor(s / 60)
+        return m + ":" + ((s % 60) < 10 ? "0" : "") + (s % 60)
+    }
+
     // left: mode badge + transport
     Row {
+        id: leftRow
         anchors.left: parent.left
         anchors.leftMargin: 12
         anchors.verticalCenter: parent.verticalCenter
@@ -27,17 +40,18 @@ Item {
                 id: stateTxt
                 anchors.centerIn: parent
                 text: root.np.rateLimited ? "⚠ LIMITED"
-                      : !root.np.active ? "■ STOPPED"
-                      : (root.np.isPlaying ? "▶ PLAYING" : "⏸ PAUSED")
+                      : !root.np.active ? root.cp("statusStopped", "■ STOPPED")
+                      : (root.np.isPlaying ? root.cp("statusPlaying", "▶ PLAYING")
+                                           : root.cp("statusPaused", "⏸ PAUSED"))
                 color: Theme.selText
                 font.pixelSize: 11
                 font.bold: true
             }
         }
 
-        IconButton { anchors.verticalCenter: parent.verticalCenter; glyph: "⏮"; size: 22; fontSize: 13; fg: Theme.subtext; onClicked: backend.prevTrack() }
-        IconButton { anchors.verticalCenter: parent.verticalCenter; glyph: root.np.active && root.np.isPlaying ? "⏸" : "▶"; size: 22; fontSize: 13; fg: Theme.text; onClicked: backend.togglePlay() }
-        IconButton { anchors.verticalCenter: parent.verticalCenter; glyph: "⏭"; size: 22; fontSize: 13; fg: Theme.subtext; onClicked: backend.nextTrack() }
+        IconButton { anchors.verticalCenter: parent.verticalCenter; glyph: root.cp("glyphPrev", "⏮"); size: 22; fontSize: 13; fg: Theme.subtext; onClicked: backend.prevTrack() }
+        IconButton { anchors.verticalCenter: parent.verticalCenter; glyph: root.np.active && root.np.isPlaying ? root.cp("glyphPause", "⏸") : root.cp("glyphPlay", "▶"); size: 22; fontSize: 13; fg: Theme.text; onClicked: backend.togglePlay() }
+        IconButton { anchors.verticalCenter: parent.verticalCenter; glyph: root.cp("glyphNext", "⏭"); size: 22; fontSize: 13; fg: Theme.subtext; onClicked: backend.nextTrack() }
 
         Text {
             anchors.verticalCenter: parent.verticalCenter
@@ -48,12 +62,103 @@ Item {
             color: root.np.active ? Theme.text : Theme.subtext
             font.pixelSize: 12
             elide: Text.ElideRight
-            width: Math.min(implicitWidth, root.width - 510)
+            width: Math.min(implicitWidth, root.width - 560)
+        }
+    }
+
+    // middle: time scrubber — drag anywhere on the track to seek
+    Item {
+        id: scrub
+        anchors.left: leftRow.right
+        anchors.leftMargin: 16
+        anchors.right: rightRow.left
+        anchors.rightMargin: 16
+        height: parent.height
+        visible: root.np.active && (root.np.durationMs || 0) > 0 && width > 90
+
+        property real npFrac: (root.np.active && root.np.durationMs > 0)
+                              ? Math.min(1, root.np.progressMs / root.np.durationMs) : 0
+        property bool dragging: false
+        property real dragFrac: 0
+        property real frac: dragging ? dragFrac : npFrac
+
+        Text {
+            id: elapsed
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            width: 36
+            horizontalAlignment: Text.AlignRight
+            text: root.fmtTime(scrub.dragging ? scrub.dragFrac * root.np.durationMs
+                                              : root.np.progressMs)
+            color: scrub.dragging ? Theme.text : Theme.subtext
+            font.pixelSize: 11
+        }
+
+        Item {
+            id: sbar
+            anchors.left: elapsed.right; anchors.leftMargin: 8
+            anchors.right: total.left; anchors.rightMargin: 8
+            anchors.verticalCenter: parent.verticalCenter
+            height: parent.height          // tall hit area; track is drawn centered
+
+            Rectangle {                    // track
+                anchors.left: parent.left; anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                height: 4; radius: 2
+                color: Theme.badge
+
+                Rectangle {                // fill
+                    anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter
+                    width: parent.width * scrub.frac
+                    height: parent.height; radius: 2
+                    color: Theme.accent
+                }
+            }
+            Rectangle {                    // handle, only while aiming
+                width: 11; height: 11; radius: 5.5
+                color: Theme.text
+                visible: scrub.dragging || sbarHover.hovered
+                anchors.verticalCenter: parent.verticalCenter
+                x: Math.max(0, Math.min(sbar.width - width,
+                                        sbar.width * scrub.frac - width / 2))
+            }
+
+            HoverHandler { id: sbarHover }
+            MouseArea {
+                anchors.fill: parent
+                preventStealing: true
+                cursorShape: Qt.PointingHandCursor
+                function apply(mx) { scrub.dragFrac = Math.max(0, Math.min(1, mx / width)) }
+                onPressed: (m) => { scrub.dragging = true; apply(m.x) }
+                onPositionChanged: (m) => { if (pressed) apply(m.x) }
+                onReleased: {
+                    backend.seek(Math.round(scrub.dragFrac * root.np.durationMs))
+                    holdoff.restart()
+                }
+            }
+            Timer {
+                // hold the dropped position until the post-seek poll lands so the
+                // fill doesn't snap back for a beat after release
+                id: holdoff
+                interval: 450
+                onTriggered: scrub.dragging = false
+            }
+        }
+
+        Text {
+            id: total
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            width: 36
+            text: root.fmtTime(root.np.durationMs)
+            color: Theme.subtext
+            font.pixelSize: 11
         }
     }
 
     // right: progress + position badges
     Row {
+        id: rightRow
         anchors.right: parent.right
         anchors.rightMargin: 12
         anchors.verticalCenter: parent.verticalCenter
@@ -164,7 +269,7 @@ Item {
             Text {
                 id: spTxt
                 anchors.centerIn: parent
-                text: "♫ frostify"
+                text: root.cp("wordmark", "♫ frostify")
                 color: Theme.teal; font.pixelSize: 11; font.bold: true
             }
         }
@@ -173,7 +278,9 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             height: 22; width: pctTxt.implicitWidth + 16; radius: Theme.radiusXs
             color: Theme.badge
-            visible: root.np.active
+            // the scrubber already shows elapsed/total; only fall back to the
+            // percent badge when the window is too narrow to fit it
+            visible: root.np.active && !scrub.visible
             Text { id: pctTxt; anchors.centerIn: parent; text: root.pct() + "%"; color: Theme.green; font.pixelSize: 11; font.bold: true }
         }
         Rectangle {
