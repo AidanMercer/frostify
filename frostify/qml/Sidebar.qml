@@ -6,7 +6,13 @@ Item {
     property var model: []
     property int cursor: 0
     property bool active: false
+    property var chrome: null      // rice theme layer — optional glyph overrides
     signal clicked(int index)
+
+    function cp(name, fallback) {
+        var v = chrome ? chrome[name] : undefined
+        return v === undefined ? fallback : v
+    }
 
     onCursorChanged: if (active) lv.positionViewAtIndex(cursor, ListView.Contain)
 
@@ -42,11 +48,11 @@ Item {
                 spacing: 8
                 Text {
                     anchors.verticalCenter: parent.verticalCenter
-                    text: modelData.pinned ? "📌"
-                        : modelData.id === "liked"   ? "♥"
-                        : modelData.id === "recent"  ? "🕘"
-                        : modelData.id === "desktop" ? "🖥"
-                        : "♫"
+                    text: modelData.pinned ? root.cp("glyphPinned", "📌")
+                        : modelData.id === "liked"   ? root.cp("glyphLiked", "♥")
+                        : modelData.id === "recent"  ? root.cp("glyphRecent", "🕘")
+                        : modelData.id === "desktop" ? root.cp("glyphDesktop", "🖥")
+                        : root.cp("glyphPlaylist", "♫")
                     color: index === root.cursor && root.active ? Theme.selText : Theme.teal
                     font.pixelSize: 13
                 }

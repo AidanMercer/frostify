@@ -8,7 +8,7 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkDiskCache
 from PySide6.QtQml import QQmlApplicationEngine, QQmlNetworkAccessManagerFactory
 
 from . import config
-from .theme import THEME
+from .theme import ThemeManager
 
 _LOG_CAP = 1024 * 1024   # truncate the log past ~1 MB so it can't grow forever
 
@@ -96,10 +96,16 @@ def main():
     app = QGuiApplication(sys.argv)
     app.setApplicationName("frostify")
     app.setDesktopFileName("frostify")  # becomes the Wayland app_id Hyprland sees
-    # monospace everywhere (yazi-style), with emoji fallback for playlist names
-    appfont = QFont()
-    appfont.setFamilies([THEME["font"], "Noto Color Emoji"])
-    app.setFont(appfont)
+
+    # follows the active rice theme (palette + optional frostify.qml chrome)
+    theme_mgr = ThemeManager(app)
+
+    def _apply_font():
+        # monospace everywhere (yazi-style), with emoji fallback for playlist names
+        appfont = QFont()
+        appfont.setFamilies([theme_mgr.theme_dict()["font"], "Noto Color Emoji"])
+        app.setFont(appfont)
+    _apply_font()
 
     from .backend import Backend
     backend = Backend()
@@ -109,7 +115,14 @@ def main():
     engine.setNetworkAccessManagerFactory(engine._nam_factory)
     ctx = engine.rootContext()
     ctx.setContextProperty("backend", backend)
-    ctx.setContextProperty("Theme", THEME)
+    ctx.setContextProperty("Theme", theme_mgr.theme_dict())
+    ctx.setContextProperty("Rice", theme_mgr)
+
+    def _retheme():
+        # re-setting the context property re-evaluates every Theme.* binding
+        ctx.setContextProperty("Theme", theme_mgr.theme_dict())
+        _apply_font()
+    theme_mgr.themeChanged.connect(_retheme)
 
     qml = Path(__file__).parent / "qml" / "Main.qml"
     engine.load(QUrl.fromLocalFile(str(qml)))

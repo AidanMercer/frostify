@@ -8,8 +8,14 @@ Item {
     property int cursor: 0
     property bool active: false
     property string nowPlayingId: ""
+    property var chrome: null      // rice theme layer — optional glyph overrides
     signal clicked(int index)
     signal moved(int index)
+
+    function cp(name, fallback) {
+        var v = chrome ? chrome[name] : undefined
+        return v === undefined ? fallback : v
+    }
 
     onCursorChanged: if (active) lv.positionViewAtIndex(cursor, ListView.Contain)
 
@@ -80,7 +86,8 @@ Item {
                 spacing: 8
                 Text {
                     width: 12
-                    text: row.isPlaying ? "▶" : (row.modelData.liked ? "♥" : "")
+                    text: row.isPlaying ? root.cp("glyphNowPlaying", "▶")
+                                        : (row.modelData.liked ? root.cp("glyphLiked", "♥") : "")
                     color: row.onCursor && root.active ? Theme.selText
                          : (row.isPlaying ? Theme.accent : Theme.green)
                     font.pixelSize: 11

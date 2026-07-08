@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
+import QtQuick.Effects
 
 ApplicationWindow {
     id: win
@@ -20,6 +21,10 @@ ApplicationWindow {
     property var np: ({ "active": false })
     property var openedPlaylist: null
     property bool loggedIn: false
+
+    // stable track identity for the theme layer — np is replaced every poll,
+    // so themes animate on host.npTrackId changes, not host.np changes
+    readonly property string npTrackId: np && np.active ? (np.id || "") : ""
 
     // yazi-style cursor state
     property string activePane: "playlists"    // "playlists" | "tracks"
@@ -75,6 +80,37 @@ ApplicationWindow {
         }
     }
 
+    // ---- rice theme layer ----
+    // Optional frostify.qml from the active ~/.config/themes/<x>/ — same slot
+    // grammar as the shell's popup.qml: invisible Item root that may expose
+    // cardBg/cardBorder/cardBorderWidth/cardRadius plus backdrop/overlay
+    // Components (mounted below/above the panes, masked to the window radius).
+    function riceProp(name, fallback) {
+        var it = riceLoader.item
+        if (!it) return fallback
+        var v = it[name]
+        return v === undefined ? fallback : v
+    }
+    Loader {
+        id: riceLoader
+        visible: false
+        function reload() {
+            source = ""   // drop the old chrome before swapping injections
+            if (!Rice.source) return
+            var props = {}
+            if (Rice.wantsPal) props.pal = Rice.pal
+            if (Rice.wantsHost) props.host = win
+            setSource(Rice.source, props)
+        }
+        onStatusChanged: if (status === Loader.Error)
+            console.warn("theme chrome failed to load:", Rice.source)
+        Component.onCompleted: reload()
+    }
+    Connections {
+        target: Rice
+        function onThemeChanged() { riceLoader.reload() }
+    }
+
     Component.onCompleted: backend.checkLogin()
 
     // pause the now-playing poll when the window loses focus, resume on return
@@ -102,10 +138,30 @@ ApplicationWindow {
 
     Rectangle {
         anchors.fill: parent
-        radius: Theme.radius
-        color: Theme.bg
-        border.color: Theme.border
-        border.width: 1
+        radius: win.riceProp("cardRadius", Theme.radius)
+        color: win.riceProp("cardBg", Theme.bg)
+        border.color: win.riceProp("cardBorder", Theme.border)
+        border.width: win.riceProp("cardBorderWidth", 1)
+
+        // rounded-rect mask so theme effects can't poke past the window corners;
+        // only rendered while a backdrop/overlay is actually mounted
+        Rectangle {
+            id: fxMask
+            anchors.fill: parent
+            radius: win.riceProp("cardRadius", Theme.radius)
+            color: "black"
+            opacity: 0
+            layer.enabled: backdropFx.item !== null || overlayFx.item !== null
+        }
+
+        // theme scenery behind the panes (shaders, particles, gradients)
+        Loader {
+            id: backdropFx
+            anchors.fill: parent
+            sourceComponent: win.riceProp("backdrop", null) || null
+            layer.enabled: item !== null
+            layer.effect: MultiEffect { maskEnabled: true; maskSource: fxMask }
+        }
 
         // invisible key catcher holds focus for navigation
         Item {
@@ -234,6 +290,7 @@ ApplicationWindow {
                     model: win.playlists
                     cursor: win.plCursor
                     active: win.activePane === "playlists"
+                    chrome: riceLoader.item
                     onClicked: function(i) { win.plCursor = i; win.openPlaylist(win.playlists[i]) }
                 }
 
@@ -247,6 +304,7 @@ ApplicationWindow {
                     cursor: win.trCursor
                     active: win.activePane === "tracks"
                     nowPlayingId: win.np.active ? win.np.id : ""
+                    chrome: riceLoader.item
                     onClicked: function(i) {
                         win.activePane = "tracks"; win.trCursor = i
                         var t = win.curTracks()[i]
@@ -271,10 +329,21 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 34
                 np: win.np
+                chrome: riceLoader.item
                 position: win.activePane === "playlists"
                     ? (win.playlists.length ? (win.plCursor + 1) + "/" + win.playlists.length : "0/0")
                     : (win.curTracks().length ? (win.trCursor + 1) + "/" + win.curTracks().length : "0/0")
             }
+        }
+
+        // theme scenery above the panes (scanlines, vignettes, frames) —
+        // click-through by contract, so it never grabs input
+        Loader {
+            id: overlayFx
+            anchors.fill: parent
+            sourceComponent: win.riceProp("overlay", null) || null
+            layer.enabled: item !== null
+            layer.effect: MultiEffect { maskEnabled: true; maskSource: fxMask }
         }
     }
 

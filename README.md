@@ -91,6 +91,31 @@ on the now-playing bar and all transport controls run locally over D-Bus.
 > device. So on a fresh launch the now-playing bar is empty until you play something
 > through frostify; after that it stays live for the whole session.
 
+## Rice theming
+
+frostify follows the active `~/.config/themes/<name>/` theme, live:
+
+- **Palette** — the theme's `config.toml` tokens (layered over
+  `themes/default/config.toml`) re-derive the whole UI palette: accents,
+  selection pills, hairlines, toast/error tints, `font_mono`. Light themes work
+  too — borders/dividers derive from the theme's ink, not hardcoded white.
+- **Chrome** — an optional `frostify.qml` in the theme folder adds the theme's
+  signature on top: window border/radius overrides, `backdrop`/`overlay`
+  Components (shaders, particles, Canvas scenery — masked to the window's
+  rounded corners), status-pill wording, sidebar/transport glyphs and the
+  status-bar wordmark. Contract and hook list live in
+  `~/.config/themes/AI-INSTRUCTION.md`.
+- **Live** — the active theme is resolved from `awww query` (focused monitor)
+  and watched via `~/.cache/awww` + the theme folder, so switching themes or
+  editing `config.toml`/`frostify.qml` re-skins the running app; `frostify.qml`
+  hot-reloads on save.
+- `FROSTIFY_THEME=<name>` (or a path) pins a theme for testing without touching
+  the desktop.
+
+Themes talk to the chrome layer through `pal` (palette snapshot) and `host`
+(now-playing state, `npTrackId` for track-change flourishes, window focus) —
+no theme file, no chrome: the stock frosted look, retinted.
+
 ## Frosted look on Hyprland (optional)
 
 Blur is automatic for the translucent window. To make it float at a nice size, add these
@@ -111,7 +136,9 @@ frostify/
     backend.py         QObject bridge — Web API on a worker thread, playback over D-Bus
     auth.py            spotipy PKCE auth + scopes
     config.py          reads ~/.config/frostify/config.toml
-    theme.py           the frosted-glass palette (exposed to QML as `Theme`)
+    theme.py           rice theme engine — palette from the active theme's
+                       config.toml (exposed as `Theme`), per-theme frostify.qml
+                       chrome loader (exposed as `Rice`), live file watching
     qml/               the UI
       Main.qml         window, layout, signal wiring
       Sidebar.qml      playlist list
