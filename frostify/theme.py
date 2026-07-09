@@ -9,7 +9,11 @@ from PySide6.QtCore import (Property, QFileSystemWatcher, QObject, QTimer,
                             QUrl, Signal)
 
 THEMES_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "themes"
-_AWWW_CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "awww"
+_CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+_AWWW_CACHE = _CACHE / "awww"
+# world80 (the rice) records the last-applied wallpaper here on every theme
+# switch — an in-place rewrite we file-watch as a belt-and-suspenders signal.
+_LAST_WALLPAPER = _CACHE / "world80" / "last-wallpaper"
 
 # dark frosted palette (tokyo-night-ish), yazi vibe. #AARRGGBB strings.
 # These are the *defaults* — used verbatim when no rice theme resolves. When one
@@ -190,9 +194,10 @@ class ThemeManager(QObject):
     - palette: config.toml tokens -> the Theme dict all the QML binds to
     - chrome slot: the theme's optional frostify.qml (same slot grammar as the
       shell's popup.qml — pal/host injection, backdrop/overlay Components)
-    - watches ~/.cache/awww (touched on every wallpaper switch) plus the active
-      theme's config.toml / frostify.qml, so switching themes or editing them
-      re-skins frostify while it runs. themeChanged fires after each rebuild.
+    - watches awww's per-monitor cache files (rewritten in place on every
+      wallpaper/theme switch) plus the active theme's config.toml / frostify.qml,
+      so switching themes or editing them re-skins frostify while it runs.
+      themeChanged fires after each rebuild.
     """
     themeChanged = Signal()
 
@@ -308,8 +313,18 @@ class ThemeManager(QObject):
     def _rewatch(self, d):
         """(Re-)arm the watcher. Dir watches catch atomic-replace saves and new
         files; file watches catch in-place edits. Stale paths are pruned by
-        QFileSystemWatcher itself when they vanish; re-adding dupes is a no-op."""
+        QFileSystemWatcher itself when they vanish; re-adding dupes is a no-op.
+
+        The live theme-switch signal is the per-monitor cache FILES awww keeps
+        under ~/.cache/awww/<ver>/<monitor>: awww rewrites them *in place* (same
+        inode, bumped mtime) on every wallpaper/theme change, which fires inotify
+        IN_MODIFY on the file but leaves the parent dir unchanged — so watching
+        only the dir (as this used to) never noticed a switch. Watch the files
+        directly, plus world80's last-wallpaper marker as a second signal."""
         want = [_AWWW_CACHE] + [p for p in _AWWW_CACHE.glob("*") if p.is_dir()]
+        want += [f for sub in _AWWW_CACHE.glob("*") if sub.is_dir()
+                 for f in sub.iterdir() if f.is_file()]
+        want += [_LAST_WALLPAPER]
         want += [THEMES_DIR / "default" / "config.toml"]
         if d is not None:
             want += [d, d / "config.toml", d / "frostify.qml"]
